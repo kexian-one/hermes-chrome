@@ -1,0 +1,17 @@
+config.yaml
+state/schedule.yaml
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+deploy/oicc-b*/
+deploy/oicc-b*.cmd
+
+# Real merchant/order data (machine-local, never commit)
+outputs/
+1688_*.csv
+chase_messages_batch*.md
+knowledge/by-machine/
+.claude/

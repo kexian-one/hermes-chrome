@@ -1,0 +1,40 @@
+# state/schedule.yaml — schedule entries (managed by the bot or by hand).
+# Each entry fires when its cron expression matches the master's polling window
+# (default poll = every 60 seconds).
+#
+# Schema:
+#   - id:         int, unique within file
+#     cron:       5-field cron expression ("minute hour dom month dow")
+#     worker:     "b1" .. "b6"
+#     skill:      skill name from skills/ directory (e.g. "fapiao-1688")
+#     enabled:    bool, default true. Disabled entries are not fired.
+#     created_by: 飞书 open_id of the user who added it (empty if added by hand)
+#     created_at: ISO 8601 timestamp (auto-filled when bot adds)
+#
+# Add entries via 飞书 bot:
+#   @bot 每天 16:00 让 b2 跑 fapiao-1688
+# Or edit this file directly.
+
+- id: 1
+  cron: "0 9 * * *"
+  worker: b1
+  skill: fapiao-1688
+  enabled: true
+  created_by: ""
+  created_at: ""
+
+- id: 2
+  cron: "30 10 * * *"
+  worker: b1
+  skill: fapiao-1688-chase
+  enabled: true
+  created_by: ""
+  created_at: ""
+
+- id: 3
+  cron: "0 16 * * *"
+  worker: b2
+  skill: fapiao-1688
+  enabled: true
+  created_by: ""
+  created_at: ""

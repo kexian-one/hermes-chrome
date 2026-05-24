@@ -1,0 +1,109 @@
+# Copy this file to config.yaml and fill in your keys.
+# config.yaml is gitignored — never commit real keys.
+
+llm:
+  # Model 1: 多模态(视觉)。供需要看图的场景使用,例如:
+  # - 飞书 bot 收到图片消息
+  # - worker 卡在滑块/验证码时需要看截图
+  # - 任何 multimodal input 的请求
+  multimodal:
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    model: qwen3-vl-max
+    api_key: sk-REPLACE_ME
+
+  # Model 2: 文本推理。worker 跑 fapiao 等技能时默认走这个 —
+  # 纯 tool calling、读 DOM 结果、不需要看图。便宜且快。
+  reasoning:
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    model: qwen3.6-plus
+    api_key: sk-REPLACE_ME
+
+# 阿里云 DashScope 区域:
+#   - 北京:    https://dashscope.aliyuncs.com/compatible-mode/v1
+#   - 新加坡:  https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+#   - 美东:    https://dashscope-us.aliyuncs.com/compatible-mode/v1
+#
+# 用编码计划(Coding Plan)的 key 时调 qwen3.6-plus 会"unsupported model",
+# 必须用标准按量付费(pay-as-you-go)的 key。
+
+# Skills 仓库(SKILL.md 文件)
+# - dir: 本地路径(**必须填绝对路径** — 相对路径会被拒绝)
+# - repo_url: 如果填了,master 启动时如果本地不存在会自动 git clone
+# - pull_interval_secs: 后台自动 git pull 频率(默认 30 分钟,必须 > 0)
+skills:
+  dir: <安装目录>\skills            # 必须绝对路径,例如 C:\Users\you\all-in-ai\skills
+  repo_url: ""                      # 例:https://github.com/yourname/all-in-ai-skills.git
+  pull_interval_secs: 1800          # 30 min,bot 用 @bot 更新 skill 可手动立刻拉
+
+# Knowledge 沉淀(Phase C)
+# - 普通机:enabled=true, is_merger=false → 写 by-machine,读 curated
+# - Merger 机:enabled=true, is_merger=true → 上面的 + 定时合并 by-machine 到 curated
+# - 全集群只有 1 台 merger,其他 false
+# - repo_url: 跟 skills 类似,master 启动时自动 git clone(如本地不存在)
+knowledge:
+  enabled: true
+  root: <安装目录>\knowledge        # 必须绝对路径,例如 C:\Users\you\all-in-ai\knowledge
+  is_merger: false                  # 这台机不做 merger;改 true 让它做
+  consolidate_cron: "0 2 * * *"     # merger 触发:每天凌晨 2 点合并(其他机不用管这个字段)
+  repo_url: ""                      # 例:https://github.com/yourname/all-in-ai-knowledge.git
+  pull_interval_secs: 300           # 5 min,knowledge 更新更频繁(必须 > 0)
+
+# 浏览器配置(给 restart_browser intent 用)。
+# - 用你的真实浏览器(已经登录 1688 + 装好扩展那个),restart 走默认 profile
+# - executable **必须**是绝对路径 — restart 只 kill `Get-Process -Path == executable`,
+#   Edge 和 Edge Dev 因为路径不同(Program Files vs AppData),不会被一起杀
+# - 你私人 Edge 窗口确实会被 kill(可接受);Edge Dev / Beta / Canary 不动
+browsers:
+  b2:
+    name: edge                      # chrome / edge / brave / vivaldi / opera
+    executable: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+    warmup_url: "https://work.1688.com"   # 启动时打开此 URL 唤醒扩展 service worker
+  b3:
+    name: chrome
+    executable: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    warmup_url: "https://work.1688.com"
+  # b1/b4/b5/b6 没配 = 无法用 @bot 重启它们的浏览器(NLU 会回 "浏览器配置缺失")
+
+# 本机标识 — 所有 bot 共用,卡片标题里显示用,例如 "[pc-jianghu] b2 任务完成"
+machine_name: pc-jianghu
+
+# 消息机器人 — 列表,一个或多个都行。同一机器可挂:
+#   - 1 个 / N 个飞书 bot(不同 app_id)
+#   - 未来可加钉钉 / 企微(需实现对应 channel 适配层)
+#
+# 路由规则:
+# - 用户在哪个 bot 的哪个群 @bot,任务完成/出错通知就回到那个群的那个 bot
+#   (跨 bot 不串)
+# - cron 定时任务、滑块告警等"无人触发"事件 → 推到 is_alert_target=true 的 bot
+#   的 alert_chat_id 群里
+#   * 整个 bots: 列表里**最多一个** bot 可以 is_alert_target=true
+#   * 一个都不填也行,那就没有主动推送,只有 @bot 回复
+# - app_id 必须唯一,重复在启动时报错
+#
+# 怎么拿 alert_chat_id:把 bot 加进目标群 → 群设置 → 最下面"会话 ID:oc_xxx"
+bots:
+  - type: feishu                  # 目前只支持 feishu
+    enabled: true
+    app_id: cli_REPLACE_ME        # 飞书开放平台 → 凭证与基础信息 → App ID
+    app_secret: REPLACE_ME        # 飞书开放平台 → 凭证与基础信息 → App Secret
+    authorized_user_ids: []       # 飞书 open_id 白名单,[] = 允许群里所有人 @bot
+                                  # 想限制时填具体的 ou_xxx,例如:
+                                  #   - ou_a1b2c3d4...
+    is_alert_target: true         # true = 此 bot 接收所有主动推送
+                                  # (滑块、worker crash、cron task done)
+                                  # 一个集群最多一个 bot 是 true
+    alert_chat_id: ""             # is_alert_target=true 时必填,推送到此群
+                                  # 填群里"会话 ID"那一串 oc_xxx
+  # 多个 bot 配置示例(取消注释,改 app_id / chat_id 即可):
+  # - type: feishu
+  #   enabled: true
+  #   app_id: cli_SECOND_BOT_ID
+  #   app_secret: secret_yyy
+  #   authorized_user_ids:
+  #     - ou_finance_lead
+  #   is_alert_target: false      # 第二个 bot 不收主动告警
+  #   alert_chat_id: ""           # 留空
+  # 未来加钉钉(等实现 agent/bot_dingtalk.py 后):
+  # - type: dingtalk
+  #   enabled: true
+  #   ...
