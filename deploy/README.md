@@ -4,16 +4,66 @@ This directory sets up 6 independent instances of
 [open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome)
 (one per browser, ports 18765–18770).
 
-## Prerequisites
+## Supported OS / Prerequisites
 
-- Windows 10/11
-- [Git for Windows](https://git-scm.com/download/win) — `git` must be on PATH
-- [Node.js 18+](https://nodejs.org/) — `node` must be on PATH
-- PowerShell 5.1 (built into Windows — no extra install needed)
+- macOS 13+ or Windows 10/11
+- Git — `git` must be on PATH
+- Node.js 18+ — `node` and `npm` must be on PATH
+- Python 3.11+
+- Windows only: PowerShell 5.1+
 - One Chrome-based browser per instance:
   - b1 → Chrome, b2 → Edge, b3 → Brave, b4 → Vivaldi, b5 → Opera, b6 → Chromium (or your choice)
 
 ---
+
+## macOS quickstart
+
+From the repository root:
+
+```bash
+bash deploy/clone-oicc.sh --count 6 --dry-run
+bash deploy/clone-oicc.sh --count 6
+```
+
+Load each unpacked extension from `deploy/oicc-b<N>/extension/`, then register
+the native messaging host for the matching browser:
+
+```bash
+bash deploy/register-native-host-macos.sh --browser Chrome   --instance 1 --extension-id <chrome-ext-id>
+bash deploy/register-native-host-macos.sh --browser Edge     --instance 2 --extension-id <edge-ext-id>
+bash deploy/register-native-host-macos.sh --browser Brave    --instance 3 --extension-id <brave-ext-id>
+bash deploy/register-native-host-macos.sh --browser Vivaldi  --instance 4 --extension-id <vivaldi-ext-id>
+bash deploy/register-native-host-macos.sh --browser Opera    --instance 5 --extension-id <opera-ext-id>
+bash deploy/register-native-host-macos.sh --browser Chromium --instance 6 --extension-id <chromium-ext-id>
+```
+
+macOS writes native messaging manifests under:
+
+| Browser | Manifest directory |
+| --- | --- |
+| Chrome | `~/Library/Application Support/Google/Chrome/NativeMessagingHosts` |
+| Edge | `~/Library/Application Support/Microsoft Edge/NativeMessagingHosts` |
+| Brave | `~/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts` |
+| Vivaldi | `~/Library/Application Support/Vivaldi/NativeMessagingHosts` |
+| Opera | `~/Library/Application Support/com.operasoftware.Opera/NativeMessagingHosts` |
+| Chromium | `~/Library/Application Support/Chromium/NativeMessagingHosts` |
+
+Preview uninstall:
+
+```bash
+bash deploy/uninstall-macos.sh --dry-run
+```
+
+Run the master on macOS:
+
+```bash
+bash start.sh
+tail -f logs/master.err.log
+```
+
+---
+
+## Windows quickstart
 
 ## Step 1 — Clone the 6 instances
 
@@ -190,8 +240,11 @@ powershell -File uninstall.ps1 -WhatIf
 ```
 deploy\
   clone-oicc.ps1            — Step 1 script
+  clone-oicc.sh             — macOS Step 1 script
   register-native-host.ps1  — Step 3 script
+  register-native-host-macos.sh
   uninstall.ps1             — Reversal script
+  uninstall-macos.sh
   config.template.json      — Port field template (reference only)
   README.md                 — This file
 
@@ -204,6 +257,7 @@ deploy\
       mcp-server.js
     ...
   oicc-b1.cmd               — .cmd launcher for native messaging
+  oicc-b1.sh                — macOS launcher for native messaging
 
   oicc-b2\ … oicc-b6\       — Edge / Brave / Vivaldi / Opera / Chromium
   oicc-b2.cmd … oicc-b6.cmd

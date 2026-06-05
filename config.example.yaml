@@ -31,7 +31,7 @@ llm:
 # - repo_url: 如果填了,master 启动时如果本地不存在会自动 git clone
 # - pull_interval_secs: 后台自动 git pull 频率(默认 30 分钟,必须 > 0)
 skills:
-  dir: <安装目录>\skills            # 必须绝对路径,例如 C:\Users\you\all-in-ai\skills
+  dir: /Users/you/all-in-ai/skills  # 必须绝对路径；Windows 例: C:\Users\you\all-in-ai\skills
   repo_url: ""                      # 例:https://github.com/yourname/all-in-ai-skills.git
   pull_interval_secs: 1800          # 30 min,bot 用 @bot 更新 skill 可手动立刻拉
 
@@ -42,7 +42,7 @@ skills:
 # - repo_url: 跟 skills 类似,master 启动时自动 git clone(如本地不存在)
 knowledge:
   enabled: true
-  root: <安装目录>\knowledge        # 必须绝对路径,例如 C:\Users\you\all-in-ai\knowledge
+  root: /Users/you/all-in-ai/knowledge  # 必须绝对路径；Windows 例: C:\Users\you\all-in-ai\knowledge
   is_merger: false                  # 这台机不做 merger;改 true 让它做
   consolidate_cron: "0 2 * * *"     # merger 触发:每天凌晨 2 点合并(其他机不用管这个字段)
   repo_url: ""                      # 例:https://github.com/yourname/all-in-ai-knowledge.git
@@ -50,17 +50,17 @@ knowledge:
 
 # 浏览器配置(给 restart_browser intent 用)。
 # - 用你的真实浏览器(已经登录 1688 + 装好扩展那个),restart 走默认 profile
-# - executable **必须**是绝对路径 — restart 只 kill `Get-Process -Path == executable`,
-#   Edge 和 Edge Dev 因为路径不同(Program Files vs AppData),不会被一起杀
+# - executable **必须**是绝对路径。macOS 可填 .app bundle 或 Contents/MacOS 下的二进制；
+#   Windows 填 .exe。restart 只 kill 路径匹配的进程，不按浏览器名字一刀切。
 # - 你私人 Edge 窗口确实会被 kill(可接受);Edge Dev / Beta / Canary 不动
 browsers:
   b2:
     name: edge                      # chrome / edge / brave / vivaldi / opera
-    executable: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+    executable: "/Applications/Microsoft Edge.app"
     warmup_url: "https://work.1688.com"   # 启动时打开此 URL 唤醒扩展 service worker
   b3:
     name: chrome
-    executable: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    executable: "/Applications/Google Chrome.app"
     warmup_url: "https://work.1688.com"
   # b1/b4/b5/b6 没配 = 无法用 @bot 重启它们的浏览器(NLU 会回 "浏览器配置缺失")
 

@@ -50,11 +50,17 @@ Intents:
 - query_stats: User wants today's statistics. Examples: "今天的统计", "今天开了多少"
 - pause_all: User wants to pause all workers. Examples: "暂停所有", "停一下"
 - resume_all: User wants to resume. Examples: "继续", "恢复"
-- run_now: User wants to spawn a skill on a specific worker IMMEDIATELY (not on a schedule). Args: {"worker_id": "bN", "skill": "<skill-name>"}. The user MAY describe the task in natural language; in that case map the description to one of the skills listed under "Available skills" below. If no skill matches, classify as unknown (do NOT invent a skill name). Examples:
+- run_now: User wants to spawn a skill on a specific worker IMMEDIATELY (not on a schedule). Args: {"worker_id": "bN", "skill": "<skill-name>", "task": "<optional runtime input>"}. Map the user's natural language to one of the skills listed under "Available skills" below. If no skill matches, classify as unknown (do NOT invent a skill name).
+    **task field**: When the user provides runtime input the skill needs (a URL, a SKU name, a filename, a topic), put that input — VERBATIM, in Chinese — into `task`. URLs go in `task` whole. If user gives no runtime input, omit `task` or set it to "". Examples below.
+    Examples:
     "b2 现在跑 fapiao-1688" → {"worker_id": "b2", "skill": "fapiao-1688"}
     "B2 现在去获取未开申请中的发票并汇总" → {"worker_id": "b2", "skill": "fapiao-1688"}    # matched by description
     "让 b3 给商家发催开票" → {"worker_id": "b3", "skill": "fapiao-1688-chase"}    # matched by description
     "b2 去京东帮我刷优惠券" → unknown   # no matching skill, do NOT invent jd-coupons
+    "b2 帮我找这个货源 https://b2b.jd.com/goods/goods-detail/10101356599310" →
+        {"worker_id": "b2", "skill": "ecom-best-source", "task": "帮我找这个货源 https://b2b.jd.com/goods/goods-detail/10101356599310"}
+    "b3 比下这个的价 https://item.jd.com/12345.html 我要的是原味70g" →
+        {"worker_id": "b3", "skill": "ecom-best-source", "task": "比下这个的价 https://item.jd.com/12345.html 我要的是原味70g"}
 - schedule_add: User wants to ADD a recurring scheduled task. Args: {"cron": "<5-field cron>", "worker_id": "bN", "skill": "<skill-name>"}. Same skill-matching rules as run_now.
     **HARD REQUIREMENT — only classify as schedule_add when the user message contains an EXPLICIT time / period word**:
     Trigger words (must appear in user text): 每天 / 每周 / 每月 / 每隔 / 每 N 小时 / 每 N 分钟 / 定时 / 周X / 早上 / 下午 / 晚上 / 点 (when referring to time, e.g. "16 点" "下午 3 点") / 分 (when time, e.g. "30 分") / at / daily / weekly / cron

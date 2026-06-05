@@ -19,8 +19,8 @@ pip install -e ".[dev]"
 Configuration lives in `config.yaml` at the project root (gitignored). Copy the template:
 
 ```bash
-copy config.example.yaml config.yaml   # PowerShell
-# or: cp config.example.yaml config.yaml
+cp config.example.yaml config.yaml     # macOS/Linux
+# or: copy config.example.yaml config.yaml   # PowerShell
 ```
 
 Then fill in your keys. The system uses **two distinct LLM models**:
@@ -52,6 +52,14 @@ python -m agent.worker --worker-id b1 --skill fapiao-1688 --port 18765
 python -m agent.master           # cron polls every 60s + bot loop (if bot.enabled)
 python -m agent.master --once    # fire any schedule entries due in the next minute, exit
 python -m agent.master --dry-run # print what would fire without spawning workers
+```
+
+On macOS, use the wrapper when you want a detached long-running process with
+log redirection and native-host manifest self-heal:
+
+```bash
+bash start.sh
+tail -f logs/master.err.log
 ```
 
 The master is **schedule-driven**: it reads `state/schedule.yaml` and fires entries whose cron matches the polling window. There is no hardcoded "run all 6 workers at 9am" — every dispatch is an explicit entry in the schedule file.
@@ -113,7 +121,8 @@ python -m pytest tests/test_llm_smoke.py -v -s
 python -m pytest tests/test_mcp_connectivity.py -v -s
 
 # Optional: target a specific port other than 18765
-$env:MCP_TEST_PORT="18766"; python -m pytest tests/test_mcp_connectivity.py -v -s
+MCP_TEST_PORT=18766 python -m pytest tests/test_mcp_connectivity.py -v -s      # macOS/Linux
+$env:MCP_TEST_PORT="18766"; python -m pytest tests/test_mcp_connectivity.py -v -s  # PowerShell
 ```
 
 Running these *first* isolates "LLM works" and "MCP works" from "full worker pipeline works" — if either skips/fails you know exactly which dep to fix.

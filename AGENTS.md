@@ -41,10 +41,13 @@ d:\ai\all-in-ai\
 │   ├── mcp_client.py
 │   ├── worker.py
 │   └── master.py
-├── deploy/                (部署脚本,主要 PowerShell)
+├── deploy/                (部署脚本,Windows PowerShell + macOS shell)
 │   ├── README.md
 │   ├── clone-oicc.ps1
+│   ├── clone-oicc.sh
 │   ├── register-native-host.ps1
+│   ├── register-native-host-macos.sh
+│   ├── uninstall-macos.sh
 │   └── config.template.json
 ├── tests/                 (pytest 测试)
 │   ├── test_skill_loader.py
@@ -181,8 +184,10 @@ python -m agent.master --dry-run    # 跟 --once 一起用看会派发什么,但
 
 ### Deploy 脚本契约(`deploy/`)
 
-- `clone-oicc.ps1 -Count 6`:克隆 [noemica-io/open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome) 6 份到 `deploy/oicc-b1` ~ `deploy/oicc-b6`,各自的 `config.json` 写不同端口(18765-18770)
-- `register-native-host.ps1 -BrowserList Chrome,Edge,Brave,Vivaldi,Opera,...`:为每个浏览器写 `HKCU\Software\<vendor>\NativeMessagingHosts\com.anthropic.open_claude_in_chrome.b<n>`,指向对应的 native host manifest 路径
+- Windows: `clone-oicc.ps1 -Count 6`:克隆 [noemica-io/open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome) 6 份到 `deploy/oicc-b1` ~ `deploy/oicc-b6`,各自的 `config.json` 写不同端口(18765-18770)
+- Windows: `register-native-host.ps1 -Browser Chrome -Instance 1 -ExtensionId <id>`:为每个浏览器写 `HKCU\Software\<vendor>\NativeMessagingHosts\com.anthropic.open_claude_in_chrome.b<n>`,指向对应的 native host manifest 路径
+- macOS: `bash deploy/clone-oicc.sh --count 6`:克隆并生成 `oicc-b<n>.sh` native host launcher
+- macOS: `bash deploy/register-native-host-macos.sh --browser Chrome --instance 1 --extension-id <id>`:写入 `~/Library/Application Support/<browser>/NativeMessagingHosts/` 下的 manifest
 
 ## 策略 vs 机制 — 谁决定卡住时怎么办
 
@@ -222,7 +227,7 @@ worker 跑到**阻塞事件**(滑块 / 验证码 / 账号异常 / 1688 风控提
 
 - worker-builder:写 `tests/test_worker_smoke.py`,**Mock 掉 LLM 和 MCP** 验证 wiring。如果有真 DeepSeek key 在 env,再加 `tests/test_worker_e2e.py`(@pytest.mark.skipif 没 key 就跳过)
 - master-builder:写 `tests/test_master_smoke.py`,subprocess Mock 6 个假 worker,验证调度和监控
-- deploy-builder:在 powershell 里**至少 dry-run** 一次脚本(可以加 `-WhatIf` 或 `-DryRun` 参数),验证不会写错路径
+- deploy-builder:Windows 在 powershell 里**至少 dry-run** 一次脚本(可以加 `-WhatIf` 或 `-DryRun` 参数);macOS 至少跑 `bash deploy/clone-oicc.sh --dry-run` 和 `bash deploy/register-native-host-macos.sh --dry-run`,验证不会写错路径
 
 ## 完工后
 

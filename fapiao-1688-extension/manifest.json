@@ -1,0 +1,32 @@
+{
+	"manifest_version": 2,
+	"name": "1688 / 淘宝 发票助手 v2",
+	"version": "2.1.1",
+	"description": "1688:抓『申请中发票』汇总 CSV。淘宝:扫『已买到的宝贝』里所有可开票订单,逐单打开自动点保存,完成即关 tab。",
+	"permissions": [
+		"tabs",
+		"downloads",
+		"storage",
+		"https://work.1688.com/*",
+		"https://air.1688.com/*",
+		"https://i.taobao.com/*",
+		"https://invoice-ua.taobao.com/*"
+	],
+	"browser_action": {
+		"default_popup": "popup.html",
+		"default_title": "1688 / 淘宝 发票助手"
+	},
+	"background": {
+		"scripts": ["background.js"],
+		"persistent": true
+	},
+	"content_scripts": [
+		{
+			"matches": ["https://work.1688.com/*"],
+			"js": ["content.js"],
+			"run_at": "document_idle",
+			"all_frames": false
+		}
+	],
+	"web_accessible_resources": ["injected.js"]
+}

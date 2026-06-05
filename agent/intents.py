@@ -36,7 +36,11 @@ class MasterDispatcher(Protocol):
     configured_browser_ids: tuple[str, ...]
 
     async def restart_worker(self, worker_id: str, reply_to: ReplyTarget | None = None) -> None: ...
-    async def spawn_now(self, worker_id: str, skill: str, reply_to: ReplyTarget | None = None) -> None: ...
+    async def spawn_now(
+        self, worker_id: str, skill: str,
+        reply_to: ReplyTarget | None = None,
+        task: str = "",
+    ) -> None: ...
     async def spawn_freeform(self, worker_id: str, task: str, reply_to: ReplyTarget | None = None) -> None: ...
     async def restart_browser_for(self, worker_id: str, reply_to: ReplyTarget | None = None) -> dict: ...
     async def restart_self(self, reply_to: ReplyTarget | None = None) -> dict: ...
@@ -265,14 +269,16 @@ async def _run_now(
 ) -> dict:
     worker_id = args.get("worker_id", "")
     skill = args.get("skill", "")
+    task = str(args.get("task", "") or "").strip()
     if not _WORKER_RE.match(worker_id):
         return error_card(f"[{machine_name}] 参数错误", "worker_id 需要 b1-b6")
     if not _SKILL_RE.match(skill):
         return error_card(f"[{machine_name}] 参数错误", "skill 名不对,例如 `fapiao-1688`")
-    await master.spawn_now(worker_id, skill, reply_to)
+    await master.spawn_now(worker_id, skill, reply_to, task=task)
+    task_hint = f" · 输入: {task[:60]}{'...' if len(task) > 60 else ''}" if task else ""
     return success_card(
         f"[{machine_name}] 已派发",
-        f"`{worker_id}` 正在跑 `{skill}`。",
+        f"`{worker_id}` 正在跑 `{skill}`{task_hint}",
     )
 
 

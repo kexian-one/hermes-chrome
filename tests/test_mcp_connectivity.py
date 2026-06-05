@@ -17,7 +17,8 @@ pytestmark = pytest.mark.skipif(
     not SCRIPT_PATH.is_file(),
     reason=(
         f"mcp-server.js not found at {SCRIPT_PATH}. "
-        f"Run deploy/clone-oicc.ps1 first, or set MCP_TEST_INSTANCE."
+        f"Run deploy/clone-oicc.ps1 (Windows) or deploy/clone-oicc.sh (macOS) first, "
+        f"or set MCP_TEST_INSTANCE."
     ),
 )
 

@@ -327,6 +327,27 @@ def test_kill_zombie_kills_multiple_ports():
     assert set(killed_pids) == {7001, 7003}
 
 
+def test_zombie_posix_lsof_parser():
+    from agent.zombies import _find_pids_on_ports
+
+    lsof = """COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+node    1234 user   24u  IPv4 0xabc      0t0  TCP 127.0.0.1:18765 (LISTEN)
+node    5678 user   25u  IPv6 0xdef      0t0  TCP *:18770 (LISTEN)
+node    9999 user   26u  IPv4 0xaaa      0t0  TCP 127.0.0.1:9999 (LISTEN)
+"""
+    with (
+        patch("agent.zombies.sys.platform", "darwin"),
+        patch("agent.zombies.subprocess.run", return_value=MagicMock(returncode=0, stdout=lsof)),
+    ):
+        assert _find_pids_on_ports() == {18765: 1234, 18770: 5678}
+
+
+def test_zombie_marker_accepts_posix_paths():
+    from agent.zombies import _is_oicc_cmdline
+
+    assert _is_oicc_cmdline("node /Users/me/all-in-ai/deploy/oicc-b2/host/mcp-server.js")
+
+
 # ---------------------------------------------------------------------------
 # Task #10 — health check
 # ---------------------------------------------------------------------------

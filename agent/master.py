@@ -296,7 +296,16 @@ class _MasterDispatcherImpl:
             lambda t, wid=worker_id, rt=resolved_reply: self._on_spawn_done(t, wid, rt)
         )
 
-    async def spawn_now(self, worker_id: str, skill: str, reply_to: ReplyTarget | None = None) -> None:
+    async def spawn_now(
+        self, worker_id: str, skill: str,
+        reply_to: ReplyTarget | None = None,
+        task: str = "",
+    ) -> None:
+        """`task`: optional free-form parameter forwarded to the skill as
+        the worker's first user message. Used when a skill needs runtime
+        input — e.g. ecom-best-source needs the JD product URL the user
+        @-mentioned in the chat. Empty string means "no extra input"
+        (the skill body is the full instruction)."""
         wc = self._worker_config(worker_id)
         if wc is None:
             return
@@ -309,16 +318,17 @@ class _MasterDispatcherImpl:
         ts = _timestamp()
         log_path = self.log_dir / f"worker-{worker_id}-{ts}.log"
         resolved_reply = self._resolve_reply_to(reply_to)
-        task = asyncio.create_task(
+        spawn_task = asyncio.create_task(
             spawn_one_skill(
                 wc, skill, log_path, tracker=self.worker_state,
                 reply_to=resolved_reply,
                 machine_name=self._machine_name_for(resolved_reply),
                 project_root=self._config.project_root,
+                task=task,
             )
         )
-        self._inflight.add(task)
-        task.add_done_callback(
+        self._inflight.add(spawn_task)
+        spawn_task.add_done_callback(
             lambda t, wid=worker_id, rt=resolved_reply: self._on_spawn_done(t, wid, rt)
         )
 
@@ -571,10 +581,14 @@ async def spawn_one_skill(
     reply_to: ReplyTarget | None = None,
     machine_name: str = "",
     project_root: Path = Path.cwd(),
+    task: str = "",
 ) -> int:
+    extra_args = ["--skill", skill]
+    if task:
+        extra_args += ["--task", task]
     return await _spawn_worker(
         wc, log_path, dry_run, tracker,
-        extra_args=["--skill", skill],
+        extra_args=extra_args,
         label=skill,
         reply_to=reply_to,
         machine_name=machine_name,
@@ -761,6 +775,7 @@ async def _spawn_worker(
             stdout=log_fh,
             stderr=log_fh,
             env=env,
+            cwd=str(project_root),
         )
         if tracker is not None:
             tracker.update_spawn(wc.worker_id, label, proc.pid)
@@ -1115,6 +1130,7 @@ async def _primary_keepalive_loop(wc: WorkerConfig, log_dir: Path) -> None:
                     proc = await asyncio.create_subprocess_exec(
                         "node", str(wc.mcp_server_js_path),
                         env=env,
+                        cwd=str(wc.mcp_server_js_path.parent),
                         stdin=asyncio.subprocess.PIPE,    # keep stdin open; mcp-server.js exits on EOF
                         stdout=log_fh,
                         stderr=log_fh,
@@ -1202,7 +1218,7 @@ async def main_loop(config: MasterConfig, dry_run: bool = False) -> None:
 
     tracker = WorkerStateTracker()
     paused: list[bool] = [False]
-    store = ScheduleStore(SCHEDULE_STATE_PATH)
+    store = ScheduleStore(config.project_root / SCHEDULE_STATE_PATH)
     unhealthy: set[str] = set()    # filled after health check; dispatcher holds the ref
 
     dispatcher = _MasterDispatcherImpl(
@@ -1253,7 +1269,7 @@ async def main_loop(config: MasterConfig, dry_run: bool = False) -> None:
 
 async def run_once(config: MasterConfig, dry_run: bool = False) -> None:
     tracker = WorkerStateTracker()
-    store = ScheduleStore(SCHEDULE_STATE_PATH)
+    store = ScheduleStore(config.project_root / SCHEDULE_STATE_PATH)
     now = datetime.now(tz=timezone.utc)
     window_end = now + timedelta(seconds=CRON_POLL_INTERVAL_SECS)
     print(f"--once window: {now.isoformat()} → {window_end.isoformat()}")

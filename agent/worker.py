@@ -131,7 +131,7 @@ async def _describe_image_blocks(
     return out
 
 
-async def run(config: WorkerConfig, system_prompt: str, label: str) -> int:
+async def run(config: WorkerConfig, system_prompt: str, label: str, user_task: str = "") -> int:
     reasoning = config.llm_reasoning
     llm = LLMClient(
         base_url=reasoning.base_url,
@@ -174,9 +174,16 @@ async def run(config: WorkerConfig, system_prompt: str, label: str) -> int:
                 if system_prompt.startswith(_WORKER_OPERATOR_GUIDANCE[:50])
                 else _WORKER_OPERATOR_GUIDANCE + "\n\n---\n\n" + system_prompt
             )
+            # Initial user message: include `--task` content if provided so the
+            # skill body can act on user-supplied parameters (e.g. a JD URL the
+            # user @-mentioned). Without --task, the skill body is the sole
+            # instruction; with --task, the LLM's first turn sees both.
+            user_first = f"执行任务: {label}"
+            if user_task:
+                user_first += f"\n\n用户消息原文:\n{user_task}"
             messages = [
                 {"role": "system", "content": full_system + knowledge_hint},
-                {"role": "user", "content": f"执行任务: {label}"},
+                {"role": "user", "content": user_first},
             ]
 
             # Detect "extension not connected" — open-claude-in-chrome's MCP
@@ -331,7 +338,7 @@ def _resolve_knowledge_root() -> Path:
         if isinstance(k, dict):
             root = str(k.get("root", "")).strip()
             if root:
-                p = Path(root)
+                p = Path(os.path.expanduser(root))
                 if p.is_absolute():
                     return p
     except Exception:
@@ -387,6 +394,18 @@ def main() -> None:
     mode.add_argument("--skill", help="skill name from skills/ dir, e.g. fapiao-1688")
     mode.add_argument("--freeform", help="ad-hoc natural-language task; runs without a SKILL.md")
     parser.add_argument(
+        "--task",
+        default="",
+        help=(
+            "Optional runtime input forwarded to the skill as the first user "
+            "message. Used when a skill needs a parameter the SKILL.md can't "
+            "hardcode — e.g. ecom-best-source needs the JD product URL the "
+            "user mentioned in chat. Only meaningful with --skill; ignored in "
+            "--freeform mode (freeform task text already lives in the system "
+            "prompt)."
+        ),
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=None,
@@ -405,7 +424,8 @@ def main() -> None:
         system_prompt = FREEFORM_SYSTEM_PROMPT + "\n\n用户任务:\n" + args.freeform
         label = f"freeform({args.freeform[:40]}{'...' if len(args.freeform) > 40 else ''})"
 
-    exit_code = asyncio.run(run(config, system_prompt, label))
+    user_task = args.task if args.skill else ""
+    exit_code = asyncio.run(run(config, system_prompt, label, user_task=user_task))
     sys.exit(exit_code)
 
 

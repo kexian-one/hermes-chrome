@@ -34,9 +34,9 @@ class WorkerConfig:
 class BrowserSpec:
     """Per-worker browser metadata for restart_browser intent.
 
-    Restart kills only processes whose .Path matches `executable`, so Edge
-    stable (Program Files) and Edge Dev (AppData) are NOT confused — they
-    have different install paths.
+    Restart kills only processes whose executable path matches `executable`.
+    On Windows this is the browser .exe path; on macOS it may be either the
+    .app bundle or the binary under Contents/MacOS.
     """
     worker_id: str
     name: str          # chrome / edge / brave / vivaldi / opera
@@ -156,12 +156,12 @@ def _require_absolute(path_str: str, label: str) -> Path:
     raw = str(path_str).strip()
     if not raw:
         raise ValueError(f"config '{label}' is empty — fill in an absolute path")
-    p = Path(raw)
+    p = Path(os.path.expanduser(raw))
     if not p.is_absolute():
         raise ValueError(
             f"config '{label}' must be an absolute path, got {raw!r}. "
             f"Edit config.yaml and use a full path (Windows: 'C:\\\\Users\\\\you\\\\...'; "
-            f"POSIX: '/home/you/...') instead of a relative one."
+            f"macOS/Linux: '/Users/you/...' or '~/...') instead of a relative one."
         )
     return p
 
@@ -218,13 +218,27 @@ def _load_llm_pair(config: dict | None = None) -> tuple[LLMSettings, LLMSettings
 def worker_config_from_file(worker_id: str, mcp_port: int | None = None) -> WorkerConfig:
     b_index = int(worker_id.lstrip("b"))
     port = mcp_port if mcp_port is not None else (18764 + b_index)
-    multimodal, reasoning = _load_llm_pair()
+    cfg = load_config_file()
+    multimodal, reasoning = _load_llm_pair(cfg)
+    project_root = _config_base_dir()
+    skills = (
+        _skills_config_from_dict(cfg["skills"])
+        if isinstance(cfg.get("skills"), dict)
+        else SkillsConfig(dir=project_root / "skills")
+    )
+    log_dir = (
+        _require_absolute(cfg["log_dir"], "log_dir")
+        if isinstance(cfg.get("log_dir"), str) and str(cfg.get("log_dir")).strip()
+        else project_root / "logs"
+    )
     return WorkerConfig(
         worker_id=worker_id,
         mcp_port=port,
         llm_multimodal=multimodal,
         llm_reasoning=reasoning,
-        mcp_server_js_path=Path(f"./deploy/oicc-{worker_id}/host/mcp-server.js").resolve(),
+        mcp_server_js_path=(project_root / f"deploy/oicc-{worker_id}/host/mcp-server.js").resolve(),
+        skills_dir=skills.dir,
+        log_dir=log_dir,
     )
 
 
@@ -275,9 +289,16 @@ def default_master_config() -> MasterConfig:
     cfg = load_config_file()
     multimodal, reasoning = _load_llm_pair(cfg)
 
-    skills = SkillsConfig()
+    machine_name = str(cfg.get("machine_name", "")).strip() or "machine"
+    project_root = _config_base_dir()
+    skills = SkillsConfig(dir=project_root / "skills")
     if isinstance(cfg.get("skills"), dict):
         skills = _skills_config_from_dict(cfg["skills"])
+    log_dir = (
+        _require_absolute(cfg["log_dir"], "log_dir")
+        if isinstance(cfg.get("log_dir"), str) and str(cfg.get("log_dir")).strip()
+        else project_root / "logs"
+    )
 
     workers = [
         WorkerConfig(
@@ -285,8 +306,9 @@ def default_master_config() -> MasterConfig:
             mcp_port=18764 + i,
             llm_multimodal=multimodal,
             llm_reasoning=reasoning,
-            mcp_server_js_path=Path(f"./deploy/oicc-b{i}/host/mcp-server.js").resolve(),
+            mcp_server_js_path=(project_root / f"deploy/oicc-b{i}/host/mcp-server.js").resolve(),
             skills_dir=skills.dir,
+            log_dir=log_dir,
         )
         for i in range(1, 7)
     ]
@@ -298,7 +320,7 @@ def default_master_config() -> MasterConfig:
                 bots_list.append(_bot_config_from_dict(d))
     # MasterConfig.__post_init__ runs `_validate_bots(...)` below; no need to
     # duplicate the validation here.
-    knowledge = KnowledgeConfig()
+    knowledge = KnowledgeConfig(root=project_root / "knowledge")
     if isinstance(cfg.get("knowledge"), dict):
         knowledge = _knowledge_config_from_dict(cfg["knowledge"])
 
@@ -316,11 +338,8 @@ def default_master_config() -> MasterConfig:
                 warmup_url=str(d.get("warmup_url", "https://work.1688.com")),
             )
 
-    machine_name = str(cfg.get("machine_name", "")).strip() or "machine"
-    project_root = _config_base_dir()
-
     return MasterConfig(
         workers=workers, machine_name=machine_name, project_root=project_root,
-        bots=tuple(bots_list),
+        log_dir=log_dir, bots=tuple(bots_list),
         knowledge=knowledge, skills=skills, browsers=browsers,
     )

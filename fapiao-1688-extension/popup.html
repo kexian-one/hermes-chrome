@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>1688 / 淘宝 发票助手</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="tabs">
+        <div class="tab active" data-tab="ali">1688 抓发票</div>
+        <div class="tab" data-tab="tb">淘宝批量开票</div>
+      </div>
+    </header>
+
+    <!-- ================ 1688 Tab ================ -->
+    <section class="panel" data-panel="ali">
+      <div id="status" class="status status-info">检查页面状态…</div>
+
+      <div id="captcha" class="status status-warn" style="display:none">
+        ⚠ 检测到滑块验证,请先在页面手动通过,再重新打开本插件。
+      </div>
+
+      <div class="actions">
+        <button id="btnOpen" class="btn btn-secondary" style="display:none">打开发票页</button>
+        <button id="btnRun" class="btn btn-primary" style="display:none">开始抓取</button>
+        <button id="btnRefresh" class="btn btn-secondary" style="display:none">重新检查</button>
+      </div>
+
+      <div id="progressBox" style="display:none">
+        <div class="progress-label"><span id="progressText">启动中…</span></div>
+        <div class="progress-bar"><div id="progressFill"></div></div>
+      </div>
+
+      <div id="results" style="display:none">
+        <div id="stats" class="stats"></div>
+
+        <div class="actions">
+          <button id="btnDownloadShopTitle" class="btn btn-primary">下载店铺+主体汇总 CSV</button>
+          <button id="btnDownloadOrders" class="btn btn-primary">下载订单明细 CSV</button>
+        </div>
+
+        <h3>Top 5 店铺(按单数)</h3>
+        <table id="topTable" class="top-table"></table>
+
+        <button id="btnRerun" class="btn btn-link">重新抓取</button>
+      </div>
+
+      <div id="error" class="status status-err" style="display:none"></div>
+    </section>
+
+    <!-- ================ 淘宝 Tab ================ -->
+    <section class="panel" data-panel="tb" style="display:none">
+      <div id="tbStatus" class="status status-info">检查页面…</div>
+
+      <div class="actions">
+        <button id="tbBtnOpen" class="btn btn-secondary" style="display:none">打开发票申请页</button>
+        <button id="tbBtnScan" class="btn btn-primary" style="display:none">开始(扫一页申请一页)</button>
+        <button id="tbBtnPause" class="btn btn-secondary" style="display:none">暂停</button>
+        <button id="tbBtnResume" class="btn btn-primary" style="display:none">继续</button>
+        <button id="tbBtnStop" class="btn btn-secondary" style="display:none">停止</button>
+        <button id="tbBtnDownload" class="btn btn-secondary" style="display:none">下载 CSV</button>
+        <button id="tbBtnReset" class="btn btn-link" style="display:none">重置</button>
+      </div>
+
+      <div id="tbEntityBox" style="display:none">
+        <h3>按主体统计</h3>
+        <table id="tbEntityTable" class="top-table"></table>
+      </div>
+
+      <div id="tbScanBox" style="display:none">
+        <div class="progress-label"><span id="tbScanText">扫描中…</span></div>
+        <div class="progress-bar"><div id="tbScanFill" style="background:#16a34a"></div></div>
+        <pre id="tbScanLog" class="log-box"></pre>
+      </div>
+
+      <div id="tbQueueBox" style="display:none">
+        <div id="tbQueueStats" class="stats"></div>
+        <h3>预览(前 10 单)</h3>
+        <table id="tbQueueTable" class="top-table"></table>
+      </div>
+
+      <div id="tbRunBox" style="display:none">
+        <div class="progress-label"><span id="tbRunText">处理中…</span></div>
+        <div class="progress-bar"><div id="tbRunFill"></div></div>
+      </div>
+
+      <div id="tbResultBox" style="display:none">
+        <div id="tbResultStats" class="stats"></div>
+        <h3>处理结果</h3>
+        <table id="tbResultTable" class="top-table"></table>
+      </div>
+
+      <div id="tbError" class="status status-err" style="display:none"></div>
+    </section>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

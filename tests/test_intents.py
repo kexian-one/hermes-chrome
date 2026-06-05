@@ -168,8 +168,31 @@ async def test_run_now_dispatches(tmp_path: Path):
         IntentDispatch(Intent.RUN_NOW, {"worker_id": "b2", "skill": "fapiao-1688"}),
         d, MACHINE,
     )
-    d.spawn_now.assert_called_once_with("b2", "fapiao-1688", None)
+    d.spawn_now.assert_called_once_with("b2", "fapiao-1688", None, task="")
     assert "b2" in _all_text(reply) and "fapiao-1688" in _all_text(reply)
+
+
+@pytest.mark.asyncio
+async def test_run_now_forwards_task_field(tmp_path: Path):
+    """run_now must forward `task` so skills like ecom-best-source can
+    receive runtime user input (URLs, SKU names) via the worker's first
+    user message."""
+    d = _make_dispatcher(tmp_path)
+    reply = await handle(
+        IntentDispatch(Intent.RUN_NOW, {
+            "worker_id": "b2", "skill": "ecom-best-source",
+            "task": "帮我找这个 https://b2b.jd.com/goods/goods-detail/10101356599310",
+        }),
+        d, MACHINE,
+    )
+    d.spawn_now.assert_called_once_with(
+        "b2", "ecom-best-source", None,
+        task="帮我找这个 https://b2b.jd.com/goods/goods-detail/10101356599310",
+    )
+    text = _all_text(reply)
+    assert "b2" in text and "ecom-best-source" in text
+    # Card should show a snippet of the input so the user can sanity check it
+    assert "10101356599310" in text
 
 
 @pytest.mark.asyncio
