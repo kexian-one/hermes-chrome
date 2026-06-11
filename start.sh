@@ -7,6 +7,88 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+check_only=0
+case "${1:-}" in
+  --check)
+    check_only=1
+    shift
+    ;;
+  -h|--help)
+    cat <<'EOF'
+Usage: bash start.sh [--check]
+
+Start the master orchestrator in the background.
+
+Options:
+  --check   Validate Python/dependencies and exit without killing or starting processes.
+EOF
+    exit 0
+    ;;
+esac
+
+choose_python() {
+  if [[ -n "${ALL_IN_AI_PYTHON:-}" ]]; then
+    PY_CMD=("$ALL_IN_AI_PYTHON")
+    return
+  fi
+
+  local candidate
+  for candidate in \
+    "${ROOT}/.venv/bin/python" \
+    python3.13 \
+    python3.12 \
+    python3.11 \
+    python3 \
+    python
+  do
+    if [[ "$candidate" == */* ]]; then
+      [[ -x "$candidate" ]] || continue
+    else
+      command -v "$candidate" >/dev/null 2>&1 || continue
+    fi
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
+    then
+      PY_CMD=("$candidate")
+      return
+    fi
+  done
+
+  if command -v uv >/dev/null 2>&1; then
+    PY_CMD=(uv run python)
+    return
+  fi
+
+  echo "[start.sh] Python 3.11+ not found. Install Python 3.11+ or uv, or set ALL_IN_AI_PYTHON." >&2
+  exit 1
+}
+
+choose_python
+
+"${PY_CMD[@]}" - <<'PY'
+import sys
+
+if sys.version_info < (3, 11):
+    raise SystemExit(f"Python 3.11+ required, got {sys.version.split()[0]}")
+try:
+    import yaml  # noqa: F401
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "PyYAML is missing for the selected Python. Run `uv sync`, "
+        "`pip install -e .`, or set ALL_IN_AI_PYTHON to a prepared venv."
+    ) from exc
+PY
+
+py_desc="$("${PY_CMD[@]}" -c 'import sys; print(sys.executable)' 2>/dev/null || printf '%s' "${PY_CMD[*]}")"
+echo "[start.sh] using Python: ${py_desc}"
+
+if [[ "$check_only" == "1" ]]; then
+  echo "[start.sh] check passed"
+  exit 0
+fi
+
 echo "[start.sh] killing old project processes..."
 
 python_re='python(3)? .*agent\.(master|worker|bot)'
@@ -31,7 +113,7 @@ fi
 sleep 0.8
 
 echo "[start.sh] checking macOS native-messaging manifests..."
-python3 - "$ROOT" <<'PY'
+"${PY_CMD[@]}" - "$ROOT" <<'PY'
 from __future__ import annotations
 
 import shutil
@@ -92,7 +174,7 @@ printf '\n========== restart %s ==========\n' "$ts" >> "$log_err"
 printf '\n========== restart %s ==========\n' "$ts" >> "$log_out"
 
 echo "[start.sh] launching master..."
-nohup python3 -u -m agent.master >> "$log_out" 2>> "$log_err" &
+nohup "${PY_CMD[@]}" -u -m agent.master >> "$log_out" 2>> "$log_err" &
 pid=$!
 sleep 0.5
 

@@ -10,6 +10,14 @@
 
 ## Install
 
+Recommended on macOS:
+
+```bash
+uv sync --extra dev
+```
+
+Or with an existing Python 3.11+ environment:
+
 ```bash
 pip install -e ".[dev]"
 ```
@@ -37,25 +45,26 @@ You can point `ALL_IN_AI_CONFIG=/path/to/other.yaml` if you need a non-default c
 ## Run a worker
 
 ```bash
-python -m agent.worker --worker-id b1 --skill fapiao-1688
+uv run python -m agent.worker --worker-id b1 --skill fapiao-1688
 ```
 
 Optional: override the MCP port:
 
 ```bash
-python -m agent.worker --worker-id b1 --skill fapiao-1688 --port 18765
+uv run python -m agent.worker --worker-id b1 --skill fapiao-1688 --port 18765
 ```
 
 ## Run the master (schedule loop + optional 飞书 bot)
 
 ```bash
-python -m agent.master           # cron polls every 60s + bot loop (if bot.enabled)
-python -m agent.master --once    # fire any schedule entries due in the next minute, exit
-python -m agent.master --dry-run # print what would fire without spawning workers
+uv run python -m agent.master           # cron polls every 60s + bot loop (if bot.enabled)
+uv run python -m agent.master --once    # fire any schedule entries due in the next minute, exit
+uv run python -m agent.master --dry-run # print what would fire without spawning workers
 ```
 
 On macOS, use the wrapper when you want a detached long-running process with
-log redirection and native-host manifest self-heal:
+log redirection and native-host manifest self-heal. It uses `ALL_IN_AI_PYTHON`
+when set, otherwise it finds a local Python 3.11+ or falls back to `uv run python`:
 
 ```bash
 bash start.sh
@@ -104,7 +113,7 @@ Bot intents (12 total):
 **Unit / smoke (always run, all mocked):**
 
 ```bash
-python -m pytest tests/ -v
+uv run --extra dev pytest tests/ -v
 ```
 
 23 tests pass with no setup. 2 MCP connectivity tests skip without a running MCP server; 2 DeepSeek smoke tests skip without `DEEPSEEK_API_KEY`.
@@ -115,13 +124,13 @@ Before running `python -m agent.master --once` for real, validate the two extern
 
 ```bash
 # 1. LLM API works + tool calling works (reads config.yaml)
-python -m pytest tests/test_llm_smoke.py -v -s
+uv run --extra dev pytest tests/test_llm_smoke.py -v -s
 
 # 2. MCP server reachable (start one oicc-b1 first via deploy/, then:)
-python -m pytest tests/test_mcp_connectivity.py -v -s
+uv run --extra dev pytest tests/test_mcp_connectivity.py -v -s
 
 # Optional: target a specific port other than 18765
-MCP_TEST_PORT=18766 python -m pytest tests/test_mcp_connectivity.py -v -s      # macOS/Linux
+MCP_TEST_PORT=18766 uv run --extra dev pytest tests/test_mcp_connectivity.py -v -s      # macOS/Linux
 $env:MCP_TEST_PORT="18766"; python -m pytest tests/test_mcp_connectivity.py -v -s  # PowerShell
 ```
 
@@ -139,7 +148,7 @@ This is intentionally not pre-emptively fixed — first real e2e will tell us if
 ## Architecture
 
 ```text
-python -m agent.worker --worker-id b1 --skill fapiao-1688
+uv run python -m agent.worker --worker-id b1 --skill fapiao-1688
   1. SkillRegistry.load_full("fapiao-1688") -> reads SKILL.md body
   2. OpenClaudeInChromeClient(port=18765) -> TCP connect to mcp-server.js
   3. LLMClient(reasoning model from config.yaml) -> OpenAI-compatible chat with tool_calls

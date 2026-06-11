@@ -38,7 +38,7 @@ class IntentDispatch:
     args: dict
 
 
-_SYSTEM_PROMPT_TEMPLATE = """You are an intent classifier for a 1688 invoice automation bot.
+_SYSTEM_PROMPT_TEMPLATE = """You are an intent classifier for an all-in-ai automation bot.
 Classify the user's message into exactly one of these intents and extract arguments.
 
 Intents:
@@ -53,9 +53,9 @@ Intents:
 - run_now: User wants to spawn a skill on a specific worker IMMEDIATELY (not on a schedule). Args: {"worker_id": "bN", "skill": "<skill-name>", "task": "<optional runtime input>"}. Map the user's natural language to one of the skills listed under "Available skills" below. If no skill matches, classify as unknown (do NOT invent a skill name).
     **task field**: When the user provides runtime input the skill needs (a URL, a SKU name, a filename, a topic), put that input — VERBATIM, in Chinese — into `task`. URLs go in `task` whole. If user gives no runtime input, omit `task` or set it to "". Examples below.
     Examples:
-    "b2 现在跑 fapiao-1688" → {"worker_id": "b2", "skill": "fapiao-1688"}
-    "B2 现在去获取未开申请中的发票并汇总" → {"worker_id": "b2", "skill": "fapiao-1688"}    # matched by description
-    "让 b3 给商家发催开票" → {"worker_id": "b3", "skill": "fapiao-1688-chase"}    # matched by description
+    "b1 现在跑 ecom-best-source https://item.jd.com/12345.html" → {"worker_id": "b1", "skill": "ecom-best-source", "task": "https://item.jd.com/12345.html"}
+    "B1 找这个上游货源 https://b2b.jd.com/goods/goods-detail/10101356599310" → {"worker_id": "b1", "skill": "ecom-best-source", "task": "找这个上游货源 https://b2b.jd.com/goods/goods-detail/10101356599310"}    # matched by description
+    "让 b2 比价这个京东链接 https://item.jd.com/12345.html 我要 232g" → {"worker_id": "b2", "skill": "ecom-best-source", "task": "比价这个京东链接 https://item.jd.com/12345.html 我要 232g"}    # matched by description
     "b2 去京东帮我刷优惠券" → unknown   # no matching skill, do NOT invent jd-coupons
     "b2 帮我找这个货源 https://b2b.jd.com/goods/goods-detail/10101356599310" →
         {"worker_id": "b2", "skill": "ecom-best-source", "task": "帮我找这个货源 https://b2b.jd.com/goods/goods-detail/10101356599310"}
@@ -67,11 +67,10 @@ Intents:
     If NONE of these appear, the user is asking for IMMEDIATE execution — classify as `run_now`, NEVER as `schedule_add`. **Do not invent a cron value from thin air.**
     Convert natural-language times to standard cron only when the user gave one.
     Examples:
-    "每天 16:00 让 b2 跑 fapiao-1688" → {"cron": "0 16 * * *", "worker_id": "b2", "skill": "fapiao-1688"} ✓ (has 每天 + 16:00)
-    "每天早上 9 点让 b1 抓未开发票" → {"cron": "0 9 * * *", "worker_id": "b1", "skill": "fapiao-1688"} ✓
-    "b2 催发票" → run_now {"worker_id": "b2", "skill": "fapiao-1688-chase"}  ✗ NO time word → MUST be run_now
-    "b2 现在跑 fapiao-1688" → run_now {...}  ✗ "现在" 是反指令 → run_now
-    "让 b3 给商家发催开票" → run_now {"worker_id": "b3", "skill": "fapiao-1688-chase"}  ✗ NO time word → run_now
+    "每天 16:00 让 b1 找货 https://item.jd.com/12345.html" → {"cron": "0 16 * * *", "worker_id": "b1", "skill": "ecom-best-source"} ✓ (has 每天 + 16:00)
+    "每天早上 9 点让 b1 跑 ecom-best-source" → {"cron": "0 9 * * *", "worker_id": "b1", "skill": "ecom-best-source"} ✓
+    "b1 找货 https://item.jd.com/12345.html" → run_now {"worker_id": "b1", "skill": "ecom-best-source", "task": "找货 https://item.jd.com/12345.html"}  ✗ NO time word → MUST be run_now
+    "b1 现在跑 ecom-best-source" → run_now {...}  ✗ "现在" 是反指令 → run_now
 - schedule_list: User wants to see all scheduled tasks. Examples: "看定时任务", "现在有哪些定时", "查 schedule", "定时任务列表"
 - skill_list: User wants to see what SKILLS (capabilities) the bot currently has installed (not scheduled tasks). Examples: "你都能干啥", "有哪些 skill", "有什么技能", "看 skill 列表", "skills"
 - schedule_remove: User wants to remove a scheduled task. Args: {"entry_id": <int>}. Examples: "删掉 #3" → {"entry_id": 3}, "删除定时 5" → {"entry_id": 5}
@@ -98,13 +97,13 @@ Respond with ONLY valid JSON in this exact format:
 {"intent": "<intent_name>", "args": {...}}
 
 Worker IDs are b1-b6. If the user says "worker 3", "b3", "账号 3", or just "3" (in a worker context), the worker_id is "b3".
-Skill names are kebab-case: "fapiao-1688", "fapiao-1688-chase", etc. Use ONLY skill names that appear in the list below.
+Skill names are kebab-case: "ecom-best-source", etc. Use ONLY skill names that appear in the list below.
 
 CONTEXT RECOVERY — when the user's CURRENT message is short, vague, or refers
 to a prior task ("重试", "重试一下", "再试一次", "再来一遍", "改成 b3", "上面那个再跑一次"),
 DO NOT classify as `unknown`. Instead:
 1. Look at "Recent conversation" (if provided) AND "[用户引用了上一条消息]" (if present)
-2. Find the most recent concrete instruction the user gave (e.g. "b2 抓 1688 发票")
+2. Find the most recent concrete instruction the user gave (e.g. "b1 找货 https://item.jd.com/12345.html")
 3. Re-emit THAT intent with THOSE args. For "重试" alone, that usually means
    re-issuing the last `run_now` / `freeform` / `restart_worker` with the same parameters.
 4. If the user is modifying ("改成 b3"), keep the same skill but update the changed field.

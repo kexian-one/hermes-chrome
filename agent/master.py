@@ -6,7 +6,9 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
+from typing import Any
 
 # Force UTF-8 on stdout/stderr — Windows default is GBK and crashes on Unicode
 # glyphs (e.g. ✓, →, emojis). Master prints status lines with these.
@@ -15,6 +17,28 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8")
     except (AttributeError, OSError):
         pass
+
+_LOG_SECRET_RE = re.compile(r"((?:access_key|ticket)=)[^&\s\]]+")
+
+
+def _redact_log_secrets(text: str) -> str:
+    return _LOG_SECRET_RE.sub(r"\1***REDACTED***", text)
+
+
+_old_log_record_factory = logging.getLogRecordFactory()
+
+
+def _redacting_log_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+    record = _old_log_record_factory(*args, **kwargs)
+    try:
+        record.msg = _redact_log_secrets(record.getMessage())
+        record.args = ()
+    except Exception:
+        pass
+    return record
+
+
+logging.setLogRecordFactory(_redacting_log_record_factory)
 
 # Logging — env var ALL_IN_AI_LOG=DEBUG/INFO/WARNING/ERROR (default INFO).
 # Without basicConfig, agent.* loggers run at WARNING and INFO calls are
@@ -32,7 +56,6 @@ if _log_level not in ("DEBUG",):
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 
 from agent.channels import ReplyTarget
 from agent.config import MasterConfig, WorkerConfig, default_master_config, worker_config_from_file
@@ -689,7 +712,7 @@ _UPLOAD_IMAGE_MAX_BYTES = 9 * 1024 * 1024     # 9 MB (image cap is 10)
 _UPLOAD_FILE_MAX_BYTES = 25 * 1024 * 1024     # 25 MB (file cap is 30)
 
 
-def _collect_outputs(output_dir: Path) -> list[Path]:
+def _collect_outputs(output_dir: Path, label: str = "") -> list[Path]:
     """Files the worker wrote that are safe to upload back to the chat.
 
     Rules:
@@ -709,12 +732,16 @@ def _collect_outputs(output_dir: Path) -> list[Path]:
         print(f"[outputs] cannot list {output_dir}: {exc}", flush=True)
         return []
     safe: list[Path] = []
+    csv_only = label == "ecom-best-source"
     for p in entries:
         try:
             if not p.is_file():
                 continue
             name = p.name
             if name.startswith(".") or name.endswith(".tmp") or name.endswith(".partial"):
+                continue
+            if csv_only and p.suffix.lower() != ".csv":
+                print(f"[outputs] skipping {name}: ecom-best-source only uploads final CSV", flush=True)
                 continue
             if p.suffix.lower() not in _UPLOAD_ALLOWED_SUFFIXES:
                 print(f"[outputs] skipping {name}: suffix {p.suffix!r} not in upload allowlist", flush=True)
@@ -731,6 +758,8 @@ def _collect_outputs(output_dir: Path) -> list[Path]:
             print(f"[outputs] skipping {name}: {size} bytes > {cap} cap", flush=True)
             continue
         safe.append(p)
+    if csv_only and len(safe) > 1:
+        safe = [max(safe, key=lambda p: p.stat().st_mtime)]
     return safe
 
 
@@ -760,6 +789,7 @@ async def _spawn_worker(
     env = dict(os.environ)
     env["WORKER_OUTPUT_DIR"] = str(output_dir)
     env["WORKER_PROJECT_ROOT"] = str(project_root.resolve())
+    env["WORKER_SKILL_NAME"] = label
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("ab") as log_fh:
@@ -801,7 +831,7 @@ async def _spawn_worker(
         _log_worker_result(wc.worker_id, label, exit_code, log_path)
 
     elapsed_s = (datetime.now(tz=timezone.utc) - started).total_seconds()
-    outputs = _collect_outputs(output_dir)
+    outputs = _collect_outputs(output_dir, label)
     await _notify_task_done(
         reply_to, machine_name,
         wc.worker_id, label, exit_code, elapsed_s,
@@ -1210,11 +1240,31 @@ async def _git_pull_loop(target_dir: Path, label: str, interval_secs: int) -> No
             print(f"[{label}] git pull failed: {exc}")
 
 
+def _active_skills_require_browser_mcp(skills_dir: Path) -> bool:
+    """Return true if any enabled skill needs the browser MCP bridge.
+
+    Unknown/parse failures stay conservative and enable browser MCP so existing
+    browser automation keeps its previous behavior.
+    """
+    try:
+        from agent.skill_loader import SkillRegistry
+        skills = SkillRegistry(skills_dir).list_skills()
+    except Exception as exc:
+        print(f"[skills] failed to inspect browser MCP requirement: {exc}; enabling browser MCP")
+        return True
+    if not skills:
+        print(f"[skills] no active skills found in {skills_dir}; browser MCP disabled")
+        return False
+    browser_skill_names = [s.name for s in skills if s.requires_browser_mcp]
+    if browser_skill_names:
+        print(f"[skills] browser MCP enabled for: {', '.join(browser_skill_names)}")
+        return True
+    print("[skills] no active skill requires browser MCP; skipping browser MCP keepalive/health")
+    return False
+
+
 async def main_loop(config: MasterConfig, dry_run: bool = False) -> None:
     from agent.zombies import kill_zombie_oicc_processes
-    from agent.health import run_health_checks, log_health_results
-
-    kill_zombie_oicc_processes()
 
     tracker = WorkerStateTracker()
     paused: list[bool] = [False]
@@ -1234,25 +1284,31 @@ async def main_loop(config: MasterConfig, dry_run: bool = False) -> None:
     if config.knowledge.enabled:
         await _ensure_cloned(knowledge_dir, config.knowledge.repo_url, "knowledge")
 
-    async with asyncio.TaskGroup() as tg:
-        # PRIMARY keepalive — start FIRST so TCP ports 18765-18770 are bound
-        # before the extension's 24s native_messaging heartbeat fires.
-        # Workers that lack `npm install` (b1/b4/b5/b6 typically) are skipped
-        # inside the loop, no error spam.
-        for wc in config.workers:
-            tg.create_task(
-                _primary_keepalive_loop(wc, config.log_dir),
-                name=f"primary-keepalive-{wc.worker_id}",
-            )
-        # Brief settle so PRIMARYs actually bind ports before health probes.
-        await asyncio.sleep(2)
+    browser_mcp_enabled = _active_skills_require_browser_mcp(skills_dir)
+    if browser_mcp_enabled:
+        kill_zombie_oicc_processes()
 
-        # Health check NOW — workers find PRIMARY already listening, their
-        # per-probe mcp-server.js enters CLIENT mode and talks to PRIMARY.
-        # If extension isn't connected to PRIMARY yet, the probe will reflect
-        # that and mark unhealthy.
-        health_results = await run_health_checks(config.workers)
-        unhealthy.update(log_health_results(health_results))
+    async with asyncio.TaskGroup() as tg:
+        if browser_mcp_enabled:
+            from agent.health import run_health_checks, log_health_results
+            # PRIMARY keepalive — start FIRST so TCP ports 18765-18770 are bound
+            # before the extension's 24s native_messaging heartbeat fires.
+            # Workers that lack `npm install` (b1/b4/b5/b6 typically) are skipped
+            # inside the loop, no error spam.
+            for wc in config.workers:
+                tg.create_task(
+                    _primary_keepalive_loop(wc, config.log_dir),
+                    name=f"primary-keepalive-{wc.worker_id}",
+                )
+            # Brief settle so PRIMARYs actually bind ports before health probes.
+            await asyncio.sleep(2)
+
+            # Health check NOW — workers find PRIMARY already listening, their
+            # per-probe mcp-server.js enters CLIENT mode and talks to PRIMARY.
+            # If extension isn't connected to PRIMARY yet, the probe will reflect
+            # that and mark unhealthy.
+            health_results = await run_health_checks(config.workers)
+            unhealthy.update(log_health_results(health_results))
 
         tg.create_task(
             _cron_loop(config, store, dry_run, tracker, paused, unhealthy, dispatcher)

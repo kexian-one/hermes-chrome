@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ def test_builtin_tools_schema_has_required_fields() -> None:
 
 def test_is_builtin() -> None:
     assert is_builtin("write_file") is True
+    assert is_builtin("run_ecom_script") is True
     assert is_builtin("javascript_tool") is False
     assert is_builtin("") is False
 
@@ -79,3 +81,76 @@ def test_unknown_builtin_returns_error(tmp_path: Path) -> None:
     result = json.loads(result_json)
     assert "error" in result
     assert "unknown builtin tool" in result["error"]
+
+
+def test_run_ecom_script_keyword_builder() -> None:
+    project_root = Path(__file__).parent.parent
+    args = json.dumps({
+        "script": "keyword_builder.py",
+        "args": ["--title", "红鸟 RED BIRD 黑色液体鞋油 75g"],
+        "timeout_seconds": 30,
+    })
+    result_json = execute_builtin("run_ecom_script", args, project_root)
+    result = json.loads(result_json)
+    assert result["ok"] is True
+    assert result["script"] == "keyword_builder.py"
+    assert "红鸟" in result["stdout"]
+
+
+def test_run_ecom_script_refuses_unknown_script(tmp_path: Path) -> None:
+    args = json.dumps({"script": "../agent/master.py"})
+    result_json = execute_builtin("run_ecom_script", args, tmp_path)
+    result = json.loads(result_json)
+    assert "error" in result
+    assert "not allowed" in result["error"]
+
+
+def test_ecom_write_file_keeps_only_csv_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "outputs" / "b1-task"
+    monkeypatch.setenv("WORKER_SKILL_NAME", "ecom-best-source")
+    monkeypatch.setenv("WORKER_OUTPUT_DIR", str(output_dir))
+
+    json_result = json.loads(execute_builtin(
+        "write_file",
+        json.dumps({"path": "final.json", "content": "{}"}),
+        tmp_path,
+    ))
+    csv_result = json.loads(execute_builtin(
+        "write_file",
+        json.dumps({"path": "找货.csv", "content": "﻿排名,标题\n1,A\n"}),
+        tmp_path,
+    ))
+
+    assert json_result["ok"] is True
+    assert csv_result["ok"] is True
+    assert (output_dir / ".ecom-scratch" / "final.json").is_file()
+    assert (output_dir / "找货.csv").is_file()
+    assert not (output_dir / "final.json").exists()
+
+
+def test_ecom_run_script_writes_json_to_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = Path(__file__).parent.parent
+    output_dir = project_root / "outputs" / ".pytest-ecom-script-scratch"
+    shutil.rmtree(output_dir, ignore_errors=True)
+    monkeypatch.setenv("WORKER_SKILL_NAME", "ecom-best-source")
+    monkeypatch.setenv("WORKER_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setenv("WORKER_PROJECT_ROOT", str(project_root))
+
+    result_json = execute_builtin(
+        "run_ecom_script",
+        json.dumps({
+            "script": "sourcing_rules.py",
+            "args": ["--smoke", "--output", "smoke.json"],
+            "timeout_seconds": 30,
+        }),
+        project_root,
+    )
+    result = json.loads(result_json)
+    assert result["ok"] is True
+    assert (output_dir / ".ecom-scratch" / "smoke.json").is_file()
+    assert not (output_dir / "smoke.json").exists()
+    shutil.rmtree(output_dir, ignore_errors=True)

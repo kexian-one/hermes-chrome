@@ -16,6 +16,7 @@ class Skill:
     body: str
     path: Path
     max_idle_minutes: int = 10
+    requires_browser_mcp: bool = True
 
 
 def _parse_skill_md(path: Path) -> tuple[dict, str]:
@@ -38,10 +39,20 @@ def _parse_max_idle_minutes(fm: dict) -> int:
     return 10
 
 
+def _parse_requires_browser_mcp(fm: dict) -> bool:
+    raw = fm.get("requires_browser_mcp")
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    log.warning("requires_browser_mcp %r is not a boolean, falling back to true", raw)
+    return True
+
+
 class SkillRegistry:
     def __init__(self, skills_dir: Path) -> None:
         self._skills_dir = skills_dir
-        self._meta: dict[str, tuple[str, str, Path, int]] = {}
+        self._meta: dict[str, tuple[str, str, Path, int, bool]] = {}
         self._scan()
 
     def _scan(self) -> None:
@@ -50,17 +61,34 @@ class SkillRegistry:
             name = fm.get("name", skill_md.parent.name)
             description = fm.get("description", "")
             max_idle = _parse_max_idle_minutes(fm)
-            self._meta[name] = (name, description, skill_md, max_idle)
+            requires_browser_mcp = _parse_requires_browser_mcp(fm)
+            self._meta[name] = (name, description, skill_md, max_idle, requires_browser_mcp)
 
     def list_skills(self) -> list[Skill]:
         return [
             Skill(name=name, description=desc, body="", path=path, max_idle_minutes=max_idle)
-            for name, desc, path, max_idle in self._meta.values()
+            if requires_browser_mcp else
+            Skill(
+                name=name,
+                description=desc,
+                body="",
+                path=path,
+                max_idle_minutes=max_idle,
+                requires_browser_mcp=False,
+            )
+            for name, desc, path, max_idle, requires_browser_mcp in self._meta.values()
         ]
 
     def load_full(self, name: str) -> Skill:
         if name not in self._meta:
             raise KeyError(f"skill {name!r} not found")
-        _name, description, path, max_idle = self._meta[name]
+        _name, description, path, max_idle, requires_browser_mcp = self._meta[name]
         _, body = _parse_skill_md(path)
-        return Skill(name=name, description=description, body=body, path=path, max_idle_minutes=max_idle)
+        return Skill(
+            name=name,
+            description=description,
+            body=body,
+            path=path,
+            max_idle_minutes=max_idle,
+            requires_browser_mcp=requires_browser_mcp,
+        )

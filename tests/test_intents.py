@@ -154,6 +154,26 @@ async def test_help(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_help_uses_active_ecom_skill_examples(tmp_path: Path):
+    d = _make_dispatcher(tmp_path)
+    skills_root = tmp_path / "skills"
+    skill_dir = skills_root / "ecom-best-source"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: ecom-best-source\ndescription: 找 1688 上游货源\n---\nbody",
+        encoding="utf-8",
+    )
+
+    reply = await handle(IntentDispatch(Intent.HELP, {}), d, MACHINE)
+    text = _all_text(reply)
+    assert "ecom-best-source" in text
+    assert "找货" in text
+    assert "item.jd.com" in text
+    assert "fapiao" not in text
+    assert "发票" not in text
+
+
+@pytest.mark.asyncio
 async def test_unknown(tmp_path: Path):
     d = _make_dispatcher(tmp_path)
     reply = await handle(IntentDispatch(Intent.UNKNOWN, {}), d, MACHINE)

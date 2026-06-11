@@ -137,14 +137,42 @@ def test_max_idle_minutes_non_integer_fallback(tmp_path: Path, caplog: pytest.Lo
     assert any("not an integer" in r.message for r in caplog.records)
 
 
-def test_real_fapiao_skill(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_requires_browser_mcp_default_true(skills_dir: Path) -> None:
+    registry = SkillRegistry(skills_dir)
+    skill = registry.load_full("test-skill")
+    assert skill.requires_browser_mcp is True
+
+
+def test_requires_browser_mcp_custom_false(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "api-only"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        textwrap.dedent("""\
+            ---
+            name: api-only
+            description: Skill without browser MCP
+            requires_browser_mcp: false
+            ---
+
+            Body.
+        """),
+        encoding="utf-8",
+    )
+    registry = SkillRegistry(tmp_path)
+    skill = registry.load_full("api-only")
+    assert skill.requires_browser_mcp is False
+    assert registry.list_skills()[0].requires_browser_mcp is False
+
+
+def test_real_ecom_skill() -> None:
     skills_dir = Path(__file__).parent.parent / "skills"
     if not skills_dir.exists():
         pytest.skip("skills/ directory not found")
     registry = SkillRegistry(skills_dir)
     names = {s.name for s in registry.list_skills()}
-    assert "fapiao-1688" in names
+    assert "ecom-best-source" in names
 
-    full = registry.load_full("fapiao-1688")
+    full = registry.load_full("ecom-best-source")
     assert len(full.body) > 100
-    assert "mtop" in full.body
+    assert full.requires_browser_mcp is False
+    assert "run_ecom_script" in full.body

@@ -245,6 +245,40 @@ def test_data_source_normalizes_and_merges_candidates() -> None:
     assert merged[0]["sources"] == ["image", "text"]
 
 
+def test_jd_product_parser_extracts_title_and_images() -> None:
+    path = (
+        Path(__file__).parent.parent
+        / "skills"
+        / "ecom-best-source"
+        / "scripts"
+        / "jd_product.py"
+    )
+    spec = importlib.util.spec_from_file_location("jd_product", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    html = """
+    <html>
+      <head>
+        <title>红鸟 RED BIRD 黑色液体鞋油 75g - 京东</title>
+        <meta property="og:title" content="红鸟 RED BIRD 黑色液体鞋油 75g">
+        <meta property="og:image" content="//img14.360buyimg.com/n1/jfs/t1/abc.jpg!q70.webp">
+      </head>
+      <body>
+        <img src="//img12.360buyimg.com/n1/jfs/t1/extra.jpg">
+      </body>
+    </html>
+    """
+    result = module.parse_product_html(html, "https://item.jd.com/100012345678.html")
+
+    assert result["title"] == "红鸟 RED BIRD 黑色液体鞋油 75g"
+    assert result["item_id"] == "100012345678"
+    assert result["main_image_url"] == "https://img14.360buyimg.com/n1/jfs/t1/abc.jpg"
+    assert "https://img12.360buyimg.com/n1/jfs/t1/extra.jpg" in result["image_urls"]
+
+
 def test_data_source_jwt_hs256_shape() -> None:
     mod = _load_data_sources_module()
 

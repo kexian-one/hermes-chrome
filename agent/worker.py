@@ -131,7 +131,176 @@ async def _describe_image_blocks(
     return out
 
 
-async def run(config: WorkerConfig, system_prompt: str, label: str, user_task: str = "") -> int:
+async def _run_chat_loop(
+    config: WorkerConfig,
+    system_prompt: str,
+    label: str,
+    user_task: str,
+    openai_tools: list[dict],
+    *,
+    mcp: OpenClaudeInChromeClient | None,
+    multimodal_llm: LLMClient,
+    llm: LLMClient,
+) -> int:
+    knowledge_topics = _list_knowledge_topics()
+    knowledge_hint = ""
+    if knowledge_topics:
+        knowledge_hint = (
+            "\n\n## 可用 knowledge topics(用 read_knowledge 工具查阅)\n"
+            + "\n".join(f"- {t}" for t in knowledge_topics)
+        )
+    # Prepend the operator guidance to every skill's system prompt so
+    # the LLM knows it has full autonomy (screenshots, mouse clicks,
+    # popup dismissal) without it being duplicated in every SKILL.md.
+    # Freeform mode's system_prompt already includes the guidance via
+    # FREEFORM_SYSTEM_PROMPT — skip the prepend to avoid duplication.
+    full_system = (
+        system_prompt
+        if system_prompt.startswith(_WORKER_OPERATOR_GUIDANCE[:50])
+        else _WORKER_OPERATOR_GUIDANCE + "\n\n---\n\n" + system_prompt
+    )
+    # Initial user message: include `--task` content if provided so the
+    # skill body can act on user-supplied parameters (e.g. a JD URL the
+    # user @-mentioned). Without --task, the skill body is the sole
+    # instruction; with --task, the LLM's first turn sees both.
+    user_first = f"执行任务: {label}"
+    if user_task:
+        user_first += f"\n\n用户消息原文:\n{user_task}"
+    messages = [
+        {"role": "system", "content": full_system + knowledge_hint},
+        {"role": "user", "content": user_first},
+    ]
+
+    # Detect "extension not connected" — open-claude-in-chrome's MCP server
+    # returns this as a SUCCESSFUL tool result (is_error=False) with the error
+    # in content text.
+    extension_disconnected = False
+    productive_calls = 0
+
+    for iteration in range(MAX_ITERATIONS):
+        try:
+            response = await llm.chat(messages, tools=openai_tools or None)
+        except Exception as exc:
+            log.error("LLM error: %s", exc)
+            return 3
+
+        if response.tool_calls:
+            assistant_msg: dict = {
+                "role": "assistant",
+                "content": response.text,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": tc.arguments},
+                    }
+                    for tc in response.tool_calls
+                ],
+            }
+            if response.reasoning_content:
+                assistant_msg["reasoning_content"] = response.reasoning_content
+            messages.append(assistant_msg)
+
+            for tc in response.tool_calls:
+                log.info("tool_call: %s args=%s", tc.name, tc.arguments[:200])
+
+                if is_builtin(tc.name):
+                    machine_id = _resolve_machine_id()
+                    proj_root_env = os.environ.get("WORKER_PROJECT_ROOT", "").strip()
+                    proj_root = Path(proj_root_env) if proj_root_env else Path.cwd()
+                    result_text = execute_builtin(
+                        tc.name, tc.arguments, proj_root,
+                        machine_id=machine_id,
+                        knowledge_root=_resolve_knowledge_root(),
+                    )
+                    is_error = False
+                elif mcp is None:
+                    result_text = (
+                        f"error: tool {tc.name!r} is unavailable because this skill "
+                        "does not enable browser MCP"
+                    )
+                    is_error = True
+                else:
+                    try:
+                        args = json.loads(tc.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
+                    try:
+                        result = await mcp.call_tool(tc.name, args)
+                    except Exception as exc:
+                        log.error("MCP tool %r failed: %s", tc.name, exc)
+                        result_text = f"error: {exc}"
+                        is_error = True
+                    else:
+                        content = result.content or []
+                        has_image = any(
+                            isinstance(b, dict) and b.get("type") == "image"
+                            for b in content
+                        )
+                        if has_image:
+                            content = await _describe_image_blocks(
+                                content, multimodal_llm, tc.name,
+                            )
+                        result_text = json.dumps(content, ensure_ascii=False)
+                        is_error = result.is_error
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_text,
+                })
+
+                if is_error:
+                    log.warning("tool %r returned error: %s", tc.name, result_text[:200])
+                else:
+                    productive_calls += 1
+
+                if "extension is not connected" in result_text.lower() or \
+                   "extension not connected" in result_text.lower():
+                    extension_disconnected = True
+
+        elif response.finish_reason == "stop":
+            if extension_disconnected:
+                log.error(
+                    "worker=%s label=%s LLM bailed (extension not connected) — exiting mcp-failed",
+                    config.worker_id, label,
+                )
+                return 2
+            log.info("LLM finished. worker=%s label=%s", config.worker_id, label)
+            return 0
+        else:
+            plain_msg: dict = {"role": "assistant", "content": response.text}
+            if response.reasoning_content:
+                plain_msg["reasoning_content"] = response.reasoning_content
+            messages.append(plain_msg)
+
+        if response.finish_reason == "stop" and not response.tool_calls:
+            if extension_disconnected:
+                log.error(
+                    "worker=%s label=%s LLM bailed (extension not connected) — exiting mcp-failed",
+                    config.worker_id, label,
+                )
+                return 2
+            if productive_calls == 0:
+                log.error(
+                    "worker=%s label=%s LLM stopped with 0 productive tool calls — exiting skill-failed",
+                    config.worker_id, label,
+                )
+                return 1
+            return 0
+
+    log.error("hit max iterations (%d) without finish", MAX_ITERATIONS)
+    return 1
+
+
+async def run(
+    config: WorkerConfig,
+    system_prompt: str,
+    label: str,
+    user_task: str = "",
+    *,
+    requires_browser_mcp: bool = True,
+) -> int:
     reasoning = config.llm_reasoning
     llm = LLMClient(
         base_url=reasoning.base_url,
@@ -145,6 +314,16 @@ async def run(config: WorkerConfig, system_prompt: str, label: str, user_task: s
         model=multimodal_cfg.model,
     )
 
+    if not requires_browser_mcp:
+        log.info(
+            "worker=%s label=%s browser_mcp=disabled builtin_tools=%d",
+            config.worker_id, label, len(BUILTIN_TOOLS),
+        )
+        return await _run_chat_loop(
+            config, system_prompt, label, user_task, BUILTIN_TOOLS,
+            mcp=None, multimodal_llm=multimodal_llm, llm=llm,
+        )
+
     try:
         async with OpenClaudeInChromeClient(
             port=config.mcp_port,
@@ -156,173 +335,10 @@ async def run(config: WorkerConfig, system_prompt: str, label: str, user_task: s
                 "worker=%s label=%s mcp_tools=%d builtin_tools=%d",
                 config.worker_id, label, len(tools), len(BUILTIN_TOOLS),
             )
-
-            knowledge_topics = _list_knowledge_topics()
-            knowledge_hint = ""
-            if knowledge_topics:
-                knowledge_hint = (
-                    "\n\n## 可用 knowledge topics(用 read_knowledge 工具查阅)\n"
-                    + "\n".join(f"- {t}" for t in knowledge_topics)
-                )
-            # Prepend the operator guidance to every skill's system prompt so
-            # the LLM knows it has full autonomy (screenshots, mouse clicks,
-            # popup dismissal) without it being duplicated in every SKILL.md.
-            # Freeform mode's system_prompt already includes the guidance via
-            # FREEFORM_SYSTEM_PROMPT — skip the prepend to avoid duplication.
-            full_system = (
-                system_prompt
-                if system_prompt.startswith(_WORKER_OPERATOR_GUIDANCE[:50])
-                else _WORKER_OPERATOR_GUIDANCE + "\n\n---\n\n" + system_prompt
+            return await _run_chat_loop(
+                config, system_prompt, label, user_task, openai_tools,
+                mcp=mcp, multimodal_llm=multimodal_llm, llm=llm,
             )
-            # Initial user message: include `--task` content if provided so the
-            # skill body can act on user-supplied parameters (e.g. a JD URL the
-            # user @-mentioned). Without --task, the skill body is the sole
-            # instruction; with --task, the LLM's first turn sees both.
-            user_first = f"执行任务: {label}"
-            if user_task:
-                user_first += f"\n\n用户消息原文:\n{user_task}"
-            messages = [
-                {"role": "system", "content": full_system + knowledge_hint},
-                {"role": "user", "content": user_first},
-            ]
-
-            # Detect "extension not connected" — open-claude-in-chrome's MCP
-            # server returns this as a SUCCESSFUL tool result (is_error=False)
-            # with the error in the content text. We catch this specific
-            # signal so the worker can exit code 2 (mcp-failed) instead of
-            # bouncing around and falsely exiting 0. We deliberately do NOT
-            # try to detect "LLM gave up" in general — that's too vague a
-            # heuristic and would false-positive on trivial skills that
-            # legitimately complete without tool calls.
-            extension_disconnected = False
-
-            for iteration in range(MAX_ITERATIONS):
-                try:
-                    response = await llm.chat(messages, tools=openai_tools or None)
-                except Exception as exc:
-                    log.error("LLM error: %s", exc)
-                    return 3
-
-                if response.tool_calls:
-                    assistant_msg: dict = {
-                        "role": "assistant",
-                        "content": response.text,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {"name": tc.name, "arguments": tc.arguments},
-                            }
-                            for tc in response.tool_calls
-                        ],
-                    }
-                    if response.reasoning_content:
-                        assistant_msg["reasoning_content"] = response.reasoning_content
-                    messages.append(assistant_msg)
-
-                    for tc in response.tool_calls:
-                        log.info("tool_call: %s args=%s", tc.name, tc.arguments[:200])
-
-                        if is_builtin(tc.name):
-                            machine_id = _resolve_machine_id()
-                            # project_root: prefer master-supplied WORKER_PROJECT_ROOT
-                            # over Path.cwd(); knowledge_root: read from config so
-                            # append_knowledge / read_knowledge hit the configured
-                            # location, not a stray ./knowledge/ off the cwd.
-                            proj_root_env = os.environ.get("WORKER_PROJECT_ROOT", "").strip()
-                            proj_root = Path(proj_root_env) if proj_root_env else Path.cwd()
-                            result_text = execute_builtin(
-                                tc.name, tc.arguments, proj_root,
-                                machine_id=machine_id,
-                                knowledge_root=_resolve_knowledge_root(),
-                            )
-                            is_error = False
-                        else:
-                            try:
-                                args = json.loads(tc.arguments)
-                            except json.JSONDecodeError:
-                                args = {}
-                            try:
-                                result = await mcp.call_tool(tc.name, args)
-                            except Exception as exc:
-                                log.error("MCP tool %r failed: %s", tc.name, exc)
-                                result_text = f"error: {exc}"
-                                is_error = True
-                            else:
-                                # If the tool returned image blocks (e.g.
-                                # computer.screenshot), route through the
-                                # multimodal model first so the text-only
-                                # reasoning model gets a description it can
-                                # actually act on, not a base64 blob.
-                                content = result.content or []
-                                has_image = any(
-                                    isinstance(b, dict) and b.get("type") == "image"
-                                    for b in content
-                                )
-                                if has_image:
-                                    content = await _describe_image_blocks(
-                                        content, multimodal_llm, tc.name,
-                                    )
-                                result_text = json.dumps(content, ensure_ascii=False)
-                                is_error = result.is_error
-
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result_text,
-                        })
-
-                        if is_error:
-                            log.warning("tool %r returned error: %s", tc.name, result_text[:200])
-
-                        # Specific signal: open-claude-in-chrome returns this
-                        # text on a "successful" tool result when its bridge to
-                        # the browser is down. We catch it here so a task that
-                        # would otherwise spend 30s thrashing and exit 0 cleanly
-                        # bails with mcp-failed (exit 2) — master can then send
-                        # a clearer "extension disconnected" card and trigger
-                        # an auto restart_browser.
-                        if "extension is not connected" in result_text.lower() or \
-                           "extension not connected" in result_text.lower():
-                            extension_disconnected = True
-
-                elif response.finish_reason == "stop":
-                    if extension_disconnected:
-                        log.error(
-                            "worker=%s label=%s LLM bailed (extension not connected) — exiting mcp-failed",
-                            config.worker_id, label,
-                        )
-                        return 2
-                    log.info("LLM finished. worker=%s label=%s", config.worker_id, label)
-                    return 0
-                else:
-                    plain_msg: dict = {"role": "assistant", "content": response.text}
-                    if response.reasoning_content:
-                        plain_msg["reasoning_content"] = response.reasoning_content
-                    messages.append(plain_msg)
-
-                if response.finish_reason == "stop" and not response.tool_calls:
-                    # Same checks as the elif above — applied here too for the
-                    # edge case where LLM returns BOTH text content AND a stop
-                    # signal without tool_calls. Avoids exit 0 on a "gave up"
-                    # response that didn't trigger the elif branch.
-                    if extension_disconnected:
-                        log.error(
-                            "worker=%s label=%s LLM bailed (extension not connected) — exiting mcp-failed",
-                            config.worker_id, label,
-                        )
-                        return 2
-                    if productive_calls == 0:
-                        log.error(
-                            "worker=%s label=%s LLM stopped with 0 productive tool calls — exiting skill-failed",
-                            config.worker_id, label,
-                        )
-                        return 1
-                    return 0
-
-            log.error("hit max iterations (%d) without finish", MAX_ITERATIONS)
-            return 1
-
     except OSError as exc:
         log.error("MCP connect failed port=%d: %s", config.mcp_port, exc)
         return 2
@@ -371,7 +387,7 @@ def _resolve_machine_id() -> str:
     return "unknown"
 
 
-def _load_skill_body(config: WorkerConfig, skill_name: str) -> tuple[str, str] | None:
+def _load_skill_body(config: WorkerConfig, skill_name: str) -> tuple[str, str, bool] | None:
     skills_dir = config.skills_dir
     if not skills_dir.is_absolute():
         skills_dir = Path.cwd() / skills_dir
@@ -381,7 +397,7 @@ def _load_skill_body(config: WorkerConfig, skill_name: str) -> tuple[str, str] |
     except KeyError:
         log.error("skill %r not found in %s", skill_name, skills_dir)
         return None
-    return (skill.body, skill.name)
+    return (skill.body, skill.name, skill.requires_browser_mcp)
 
 
 def main() -> None:
@@ -419,13 +435,20 @@ def main() -> None:
         loaded = _load_skill_body(config, args.skill)
         if loaded is None:
             sys.exit(4)
-        system_prompt, label = loaded
+        system_prompt, label, requires_browser_mcp = loaded
     else:
         system_prompt = FREEFORM_SYSTEM_PROMPT + "\n\n用户任务:\n" + args.freeform
         label = f"freeform({args.freeform[:40]}{'...' if len(args.freeform) > 40 else ''})"
+        requires_browser_mcp = True
 
     user_task = args.task if args.skill else ""
-    exit_code = asyncio.run(run(config, system_prompt, label, user_task=user_task))
+    exit_code = asyncio.run(run(
+        config,
+        system_prompt,
+        label,
+        user_task=user_task,
+        requires_browser_mcp=requires_browser_mcp,
+    ))
     sys.exit(exit_code)
 
 

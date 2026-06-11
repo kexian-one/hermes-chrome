@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -10,6 +11,7 @@ import pytest
 
 from agent.config import LLMSettings, MasterConfig, WorkerConfig
 from agent.master import (
+    _collect_outputs,
     fire_due_entries,
     run_once,
     spawn_one_skill,
@@ -265,6 +267,23 @@ async def test_spawn_one_skill_uploads_output_files(tmp_path: Path):
     assert len(cards_sent) == 1
     assert len(files_sent) == 1
     assert files_sent[0].endswith("report.csv")
+
+
+def test_collect_outputs_ecom_only_returns_one_csv(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "final.json").write_text("{}", encoding="utf-8")
+    (output_dir / "merged_input.json").write_text("{}", encoding="utf-8")
+    old_csv = output_dir / "old.csv"
+    new_csv = output_dir / "new.csv"
+    old_csv.write_text("a\n", encoding="utf-8")
+    new_csv.write_text("b\n", encoding="utf-8")
+    os.utime(old_csv, (1000, 1000))
+    os.utime(new_csv, (2000, 2000))
+
+    outputs = _collect_outputs(output_dir, label="ecom-best-source")
+
+    assert outputs == [new_csv]
 
 
 @pytest.mark.asyncio

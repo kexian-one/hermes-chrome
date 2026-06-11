@@ -48,6 +48,44 @@ knowledge:
   repo_url: ""                      # 例:https://github.com/yourname/all-in-ai-knowledge.git
   pull_interval_secs: 300           # 5 min,knowledge 更新更频繁(必须 > 0)
 
+# 电商找货源 / 1688 比价 skill 私有配置。
+# 仅 `skills/ecom-best-source` 使用；不用该 skill 时可以删除或留空。
+# 不要把真实 key/secret 提交到 git；真实值只放 gitignored 的 config.yaml。
+ecom_best_source:
+  data_source: hybrid               # onebound / mcp / hybrid
+  onebound:
+    base: https://api-gw.onebound.cn/1688
+    key: ""
+    secret: ""
+    http_timeout: 30
+    cost_per_call_yuan: 0.022
+  alphashop_mcp:
+    endpoint: https://mcp.alphashop.cn/sse
+    ak: ""
+    sk: ""
+    jwt_expire_seconds: 1800
+    http_timeout: 60
+  ai:
+    # APIMart OpenAI-compatible Chat Completions API:
+    #   POST https://api.apimart.ai/v1/chat/completions
+    #   Authorization: Bearer <api_key>
+    #   body: { model: "gpt-5.5", messages: [...] }
+    keyword_extract:
+      base_url: https://api.apimart.ai/v1
+      model: gpt-5.5
+      api_key: ""
+      enabled: false                 # 填真实 api_key 后改 true
+    matcher:
+      base_url: https://api.apimart.ai/v1
+      model: gpt-5.5
+      api_key: ""
+      enabled: false                 # 填真实 api_key 后改 true
+    title_normalize:
+      base_url: https://api.apimart.ai/v1
+      model: gpt-5.5
+      api_key: ""
+      enabled: false                 # 填真实 api_key 后改 true
+
 # 浏览器配置(给 restart_browser intent 用)。
 # - 用你的真实浏览器(已经登录 1688 + 装好扩展那个),restart 走默认 profile
 # - executable **必须**是绝对路径。macOS 可填 .app bundle 或 Contents/MacOS 下的二进制；

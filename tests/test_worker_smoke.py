@@ -166,9 +166,41 @@ def test_existing_skill_loads(skills_dir: Path) -> None:
     )
     loaded = _load_skill_body(config, "fapiao-1688")
     assert loaded is not None
-    body, name = loaded
+    body, name, requires_browser_mcp = loaded
     assert name == "fapiao-1688"
     assert "执行步骤" in body
+    assert requires_browser_mcp is True
+
+
+@pytest.mark.asyncio
+async def test_run_without_browser_mcp_does_not_connect(skills_dir: Path) -> None:
+    config = WorkerConfig(
+        worker_id="b1",
+        mcp_port=18765,
+        skills_dir=skills_dir,
+        llm_multimodal=_DUMMY_LLM,
+        llm_reasoning=_DUMMY_LLM,
+        log_dir=Path("/tmp"),
+    )
+    mock_llm = AsyncMock()
+    mock_llm.chat = AsyncMock(return_value=ChatResponse(
+        text="任务完成",
+        tool_calls=[],
+        finish_reason="stop",
+    ))
+
+    with (
+        patch("agent.worker.LLMClient", return_value=mock_llm),
+        patch("agent.worker.OpenClaudeInChromeClient", side_effect=AssertionError("MCP should not connect")),
+    ):
+        exit_code = await run(
+            config,
+            "test prompt",
+            "ecom-best-source",
+            requires_browser_mcp=False,
+        )
+
+    assert exit_code == 0
 
 
 @pytest.mark.asyncio

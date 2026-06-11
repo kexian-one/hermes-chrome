@@ -100,7 +100,7 @@ async def handle(
         case Intent.RESTART_SELF:
             return await master.restart_self(reply_to)
         case Intent.HELP:
-            return _help(machine_name)
+            return _help(master, machine_name)
         case _:
             return warning_card(
                 f"[{machine_name}] 没听懂",
@@ -329,7 +329,7 @@ def _schedule_list(master: MasterDispatcher, machine_name: str) -> dict:
     if not entries:
         return info_card(
             f"[{machine_name}] 定时任务",
-            "没有定时任务。用 `每天 16:00 让 b2 跑 fapiao-1688` 添加。",
+            "没有定时任务。用 `每天 16:00 让 b1 找货 https://item.jd.com/12345.html` 添加。",
         )
 
     lines = ["| # | cron | worker | skill | 状态 |", "| --- | --- | --- | --- | --- |"]
@@ -523,8 +523,57 @@ async def _restart_browser(
     return await master.restart_browser_for(worker_id, reply_to)
 
 
-def _help(machine_name: str) -> dict:
-    body = """\
+def _active_skill_names(master: MasterDispatcher) -> list[str]:
+    try:
+        if not master.skills_dir.is_dir():
+            return []
+        return [s.name for s in SkillRegistry(master.skills_dir).list_skills()]
+    except Exception:
+        return []
+
+
+def _help_examples_for_skills(skill_names: list[str]) -> str:
+    if "ecom-best-source" in skill_names:
+        return """\
+**立即执行**
+- `b1 找货 https://b2b.jd.com/goods/goods-detail/10128813484820` — 根据京东/京东万商链接找 1688 上游货源
+- `b1 比价 https://item.jd.com/12345.html 我要 232g` — 带 SKU/规格要求找同款
+- `b1 现在跑 ecom-best-source https://item.jd.com/12345.html` — 跑指定 skill(精确名)
+- `重启 b1` — 重启 worker 进程
+- `重启你自己` / `重启 master` — 重启 master 主进程(re-exec,需所有 worker 空闲)
+
+**定时管理**
+- `每天 16:00 让 b1 找货 https://item.jd.com/12345.html` — 添加定时
+- `删掉 #3` — 删除编号 3 的定时"""
+    if skill_names:
+        first = skill_names[0]
+        return f"""\
+**立即执行**
+- `b1 现在跑 {first}` — 跑指定 skill(精确名)
+- `b1 描述你要做的任务` — 描述任务,自动匹配已安装 skill
+- `重启 b1` — 重启 worker 进程
+- `重启你自己` / `重启 master` — 重启 master 主进程(re-exec,需所有 worker 空闲)
+
+**定时管理**
+- `每天 16:00 让 b1 跑 {first}` — 添加定时
+- `删掉 #3` — 删除编号 3 的定时"""
+    return """\
+**立即执行**
+- 当前没有启用的 skill。先用 `看 skill 列表` 确认技能目录。
+- `重启你自己` / `重启 master` — 重启 master 主进程(re-exec,需所有 worker 空闲)
+
+**定时管理**
+- `看定时任务` — 列出所有定时
+- `删掉 #3` — 删除编号 3 的定时"""
+
+
+def _help(master: MasterDispatcher, machine_name: str) -> dict:
+    skill_names = _active_skill_names(master)
+    skill_line = (
+        ", ".join(f"`{name}`" for name in skill_names)
+        if skill_names else "(无启用 skill)"
+    )
+    body = f"""\
 **查询类**
 - `查状态` — 列出 worker 当前状态
 - `看 b3 日志` — 查看 worker 最近 50 行
@@ -534,17 +583,10 @@ def _help(machine_name: str) -> dict:
 - `查 knowledge XX` — 查 knowledge 主题(支持模糊匹配)
 - `/help` — 本帮助
 
-**立即执行**
-- `b2 现在跑 fapiao-1688` — 跑指定 skill(精确名)
-- `b2 帮我抓未开发票` — 描述任务,自动匹配 skill
-- `b2 去京东刷购物车` — freeform 模式(没匹配的 skill 时兜底)
-- `重启 b3` — 重启 worker 进程
-- `重启 b3 浏览器` — 重启 worker 对应的浏览器
-- `重启你自己` / `重启 master` — 重启 master 主进程(re-exec,需所有 worker 空闲)
+**当前启用 skill**
+{skill_line}
 
-**定时管理**
-- `每天 16:00 让 b2 跑 fapiao-1688` — 添加定时
-- `删掉 #3` — 删除编号 3 的定时
+{_help_examples_for_skills(skill_names)}
 
 **维护**
 - `更新 skill` — git pull 拉新 skill

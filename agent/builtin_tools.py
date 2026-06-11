@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -135,6 +137,46 @@ BUILTIN_TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_ecom_script",
+            "description": (
+                "Run an approved helper script from skills/ecom-best-source/scripts. "
+                "Use this for ecom-best-source workflows such as extracting JD product "
+                "metadata, checking masked ecom config, fetching 1688 candidates, "
+                "building keywords, and applying sourcing rules. The command runs with "
+                "the current Python executable in the project root and returns stdout, "
+                "stderr, and the exit code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "enum": [
+                            "ecom_config.py",
+                            "jd_product.py",
+                            "keyword_builder.py",
+                            "fetch_candidates.py",
+                            "sourcing_rules.py",
+                        ],
+                        "description": "Approved script filename.",
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Command-line arguments, excluding Python and script path.",
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Timeout in seconds, default 120, max 300.",
+                    },
+                },
+                "required": ["script"],
+            },
+        },
+    },
 ]
 
 BUILTIN_TOOL_NAMES: frozenset[str] = frozenset(t["function"]["name"] for t in BUILTIN_TOOLS)
@@ -185,6 +227,22 @@ def _resolve_safe(path_str: str, project_root: Path, *, for_write: bool = True) 
     return resolved
 
 
+def _is_ecom_worker() -> bool:
+    return os.environ.get("WORKER_SKILL_NAME", "").strip() == "ecom-best-source"
+
+
+def _output_dir() -> Path | None:
+    raw = os.environ.get("WORKER_OUTPUT_DIR", "").strip()
+    return Path(raw).resolve() if raw else None
+
+
+def _ecom_scratch_dir(project_root: Path) -> Path:
+    output_dir = _output_dir()
+    if output_dir:
+        return output_dir / ".ecom-scratch"
+    return project_root.resolve() / "outputs" / ".ecom-scratch"
+
+
 def execute_builtin(
     tool_name: str,
     arguments_json: str,
@@ -206,6 +264,8 @@ def execute_builtin(
         return _append_knowledge(args, machine_id, knowledge_root or (project_root / "knowledge"))
     if tool_name == "read_knowledge":
         return _read_knowledge(args, knowledge_root or (project_root / "knowledge"))
+    if tool_name == "run_ecom_script":
+        return _run_ecom_script(args, project_root)
     return json.dumps({"error": f"unknown builtin tool: {tool_name}"})
 
 
@@ -239,6 +299,9 @@ def _write_file(args: dict, project_root: Path) -> str:
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
 
+    if _is_ecom_worker() and target.suffix.lower() != ".csv":
+        target = (_ecom_scratch_dir(project_root) / Path(path).name).resolve()
+
     rel = target.relative_to(project_root.resolve())
     allowed, reason = _write_path_allowed(rel)
     if not allowed:
@@ -268,16 +331,28 @@ def _read_file(args: dict, project_root: Path) -> str:
     if max_bytes <= 0:
         max_bytes = _READ_FILE_DEFAULT_MAX_BYTES
 
-    # Same containment check as write_file (must stay under project root),
-    # but relative paths resolve to project_root NOT output_dir — skills
-    # need to read input files like chase_messages_batch1.md at root.
+    # Same containment check as write_file (must stay under project root).
+    # For ecom-best-source, intermediate JSON lives under a hidden scratch dir
+    # inside the task output directory so it is readable but not uploaded.
     try:
         target = _resolve_safe(path, project_root, for_write=False)
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
 
     if not target.is_file():
-        return json.dumps({"error": f"file not found: {path}"})
+        if _is_ecom_worker() and not Path(path).is_absolute():
+            candidates = [_ecom_scratch_dir(project_root) / path]
+            output_dir = _output_dir()
+            if output_dir:
+                candidates.append(output_dir / path)
+            for candidate in candidates:
+                if candidate.is_file():
+                    target = candidate.resolve()
+                    break
+            else:
+                return json.dumps({"error": f"file not found: {path}"})
+        else:
+            return json.dumps({"error": f"file not found: {path}"})
 
     try:
         size = target.stat().st_size
@@ -355,3 +430,146 @@ def _append_knowledge(args: dict, machine_id: str, knowledge_root: Path) -> str:
         "topic": topic,
         "bytes_written": len(content.encode("utf-8")),
     })
+
+
+_ECOM_SCRIPT_ALLOWLIST = frozenset({
+    "ecom_config.py",
+    "jd_product.py",
+    "keyword_builder.py",
+    "fetch_candidates.py",
+    "sourcing_rules.py",
+})
+_ECOM_SCRIPT_INPUT_FLAGS = frozenset({"--input", "-i"})
+_ECOM_SCRIPT_OUTPUT_FLAGS = frozenset({"--output", "-o"})
+_ECOM_SCRIPT_STREAM_LIMIT = 20000
+
+
+def _truncate_text(text: str, limit: int = _ECOM_SCRIPT_STREAM_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return text[:limit] + f"\n...[truncated {omitted} chars]"
+
+
+def _validate_ecom_script_args(argv: list[str], project_root: Path) -> str | None:
+    """Keep script file output inside project root when callers pass --output."""
+    project_root = project_root.resolve()
+    for idx, arg in enumerate(argv):
+        if arg not in _ECOM_SCRIPT_OUTPUT_FLAGS:
+            continue
+        if idx + 1 >= len(argv):
+            return f"{arg} requires a path value"
+        value = argv[idx + 1]
+        target = Path(value)
+        if target.is_absolute():
+            resolved = target.resolve()
+        else:
+            output_dir = os.environ.get("WORKER_OUTPUT_DIR", "").strip()
+            base = Path(output_dir).resolve() if output_dir else project_root
+            resolved = (base / target).resolve()
+        try:
+            resolved.relative_to(project_root)
+        except ValueError:
+            return f"output path {resolved} is outside project root {project_root}"
+    return None
+
+
+def _resolve_ecom_runtime_path(value: str, project_root: Path, *, for_output: bool) -> str:
+    path = Path(value)
+    if path.is_absolute():
+        return str(path)
+
+    project_root = project_root.resolve()
+    if for_output:
+        output_dir = _output_dir()
+        base = (output_dir or project_root) if path.suffix.lower() == ".csv" else _ecom_scratch_dir(project_root)
+        base.mkdir(parents=True, exist_ok=True)
+        return str((base / path.name).resolve())
+
+    output_dir = _output_dir()
+    candidates = [
+        _ecom_scratch_dir(project_root) / value,
+        output_dir / value if output_dir else None,
+        project_root / value,
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return str(candidate.resolve())
+    return str((project_root / value).resolve())
+
+
+def _rewrite_ecom_script_args(argv: list[str], project_root: Path) -> list[str]:
+    out = list(argv)
+    for idx, arg in enumerate(out[:-1]):
+        if arg in _ECOM_SCRIPT_OUTPUT_FLAGS:
+            out[idx + 1] = _resolve_ecom_runtime_path(out[idx + 1], project_root, for_output=True)
+        elif arg in _ECOM_SCRIPT_INPUT_FLAGS:
+            out[idx + 1] = _resolve_ecom_runtime_path(out[idx + 1], project_root, for_output=False)
+    return out
+
+
+def _run_ecom_script(args: dict, project_root: Path) -> str:
+    script = args.get("script")
+    argv = args.get("args", [])
+    if not isinstance(script, str) or not script:
+        return json.dumps({"error": "run_ecom_script requires script (str)"})
+    script_name = Path(script).name
+    if script_name != script or script_name not in _ECOM_SCRIPT_ALLOWLIST:
+        return json.dumps({"error": f"script {script!r} is not allowed"})
+    if not isinstance(argv, list) or not all(isinstance(v, str) for v in argv):
+        return json.dumps({"error": "run_ecom_script args must be a list of strings"})
+
+    try:
+        timeout = int(args.get("timeout_seconds", 120))
+    except (TypeError, ValueError):
+        timeout = 120
+    timeout = max(1, min(timeout, 300))
+
+    env_root = os.environ.get("WORKER_PROJECT_ROOT", "").strip()
+    if env_root:
+        project_root = Path(env_root)
+    project_root = project_root.resolve()
+    script_path = project_root / "skills" / "ecom-best-source" / "scripts" / script_name
+    if not script_path.is_file():
+        return json.dumps({"error": f"script not found: {script_name}"})
+
+    arg_error = _validate_ecom_script_args(argv, project_root)
+    if arg_error:
+        return json.dumps({"error": arg_error})
+
+    env = dict(os.environ)
+    output_dir = env.get("WORKER_OUTPUT_DIR", "").strip()
+    if output_dir:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    argv = _rewrite_ecom_script_args(argv, project_root)
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script_path), *argv],
+            cwd=project_root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return json.dumps({
+            "ok": False,
+            "script": script_name,
+            "timeout_seconds": timeout,
+            "error": "timeout",
+            "stdout": _truncate_text(exc.stdout or ""),
+            "stderr": _truncate_text(exc.stderr or ""),
+        }, ensure_ascii=False)
+    except OSError as exc:
+        return json.dumps({"ok": False, "script": script_name, "error": str(exc)}, ensure_ascii=False)
+
+    return json.dumps({
+        "ok": proc.returncode == 0,
+        "script": script_name,
+        "returncode": proc.returncode,
+        "stdout": _truncate_text(proc.stdout),
+        "stderr": _truncate_text(proc.stderr),
+    }, ensure_ascii=False)
