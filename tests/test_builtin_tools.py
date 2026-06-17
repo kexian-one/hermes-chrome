@@ -154,3 +154,66 @@ def test_ecom_run_script_writes_json_to_scratch(
     assert (output_dir / ".ecom-scratch" / "smoke.json").is_file()
     assert not (output_dir / "smoke.json").exists()
     shutil.rmtree(output_dir, ignore_errors=True)
+
+
+def test_ecom_run_script_pipeline_writes_csv_visible_and_json_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = Path(__file__).parent.parent
+    output_dir = project_root / "outputs" / ".pytest-ecom-pipeline"
+    scratch_dir = output_dir / ".ecom-scratch"
+    shutil.rmtree(output_dir, ignore_errors=True)
+    scratch_dir.mkdir(parents=True)
+    monkeypatch.setenv("WORKER_SKILL_NAME", "ecom-best-source")
+    monkeypatch.setenv("WORKER_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setenv("WORKER_PROJECT_ROOT", str(project_root))
+
+    (scratch_dir / "jd_product.json").write_text(
+        json.dumps({
+            "title": "红鸟 RED BIRD 黑色液体鞋油 75g",
+            "jd_url": "https://item.jd.com/100012345678.html",
+            "main_image_url": "https://img.example/jd.jpg",
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (scratch_dir / "candidates.json").write_text(
+        json.dumps({
+            "candidates": [
+                {
+                    "num_iid": "1001",
+                    "title": "红鸟黑色液体鞋油75g批发",
+                    "detail_url": "https://detail.1688.com/offer/1001.html",
+                    "unitPrice": 3.2,
+                    "compositeScore": 4.8,
+                    "shopYear": 8,
+                    "MOQ": 3,
+                    "shopName": "义乌红鸟日化",
+                    "sources": ["text", "image"],
+                }
+            ]
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result_json = execute_builtin(
+        "run_ecom_script",
+        json.dumps({
+            "script": "sourcing_pipeline.py",
+            "args": [
+                "--jd-product", "jd_product.json",
+                "--candidates", "candidates.json",
+                "--buy-multiple", "3",
+                "--output", "找货_红鸟鞋油75g_20260615.csv",
+                "--json-output", "final.json",
+            ],
+            "timeout_seconds": 30,
+        }),
+        project_root,
+    )
+    result = json.loads(result_json)
+    assert result["ok"] is True
+    assert (output_dir / "找货_红鸟鞋油75g_20260615.csv").is_file()
+    assert (scratch_dir / "final.json").is_file()
+    assert not (output_dir / "final.json").exists()
+    assert (output_dir / "找货_红鸟鞋油75g_20260615.csv").read_bytes().startswith(b"\xef\xbb\xbf")
+    shutil.rmtree(output_dir, ignore_errors=True)

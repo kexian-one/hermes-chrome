@@ -160,6 +160,7 @@ BUILTIN_TOOLS: list[dict] = [
                             "keyword_builder.py",
                             "fetch_candidates.py",
                             "sourcing_rules.py",
+                            "sourcing_pipeline.py",
                         ],
                         "description": "Approved script filename.",
                     },
@@ -438,9 +439,10 @@ _ECOM_SCRIPT_ALLOWLIST = frozenset({
     "keyword_builder.py",
     "fetch_candidates.py",
     "sourcing_rules.py",
+    "sourcing_pipeline.py",
 })
-_ECOM_SCRIPT_INPUT_FLAGS = frozenset({"--input", "-i"})
-_ECOM_SCRIPT_OUTPUT_FLAGS = frozenset({"--output", "-o"})
+_ECOM_SCRIPT_INPUT_FLAGS = frozenset({"--input", "-i", "--jd-product", "--candidates"})
+_ECOM_SCRIPT_OUTPUT_FLAGS = frozenset({"--output", "-o", "--json-output"})
 _ECOM_SCRIPT_STREAM_LIMIT = 20000
 
 

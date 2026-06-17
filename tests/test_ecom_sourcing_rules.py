@@ -57,6 +57,42 @@ def _load_data_sources_module():
         sys.path.remove(str(scripts_dir))
 
 
+def _load_pipeline_module():
+    scripts_dir = (
+        Path(__file__).parent.parent
+        / "skills"
+        / "ecom-best-source"
+        / "scripts"
+    )
+    sys.path.insert(0, str(scripts_dir))
+    try:
+        path = scripts_dir / "sourcing_pipeline.py"
+        spec = importlib.util.spec_from_file_location("ecom_sourcing_pipeline", path)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path.remove(str(scripts_dir))
+
+
+def _load_keyword_module():
+    path = (
+        Path(__file__).parent.parent
+        / "skills"
+        / "ecom-best-source"
+        / "scripts"
+        / "keyword_builder.py"
+    )
+    spec = importlib.util.spec_from_file_location("ecom_keyword_builder", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_original_skill_price_weight_makes_cheaper_candidate_win() -> None:
     rules = _load_rules_module()
     result = rules.run_pipeline({
@@ -122,12 +158,13 @@ def test_current_rule_downgrades_service_but_ignores_invoice_for_scoring() -> No
         ],
     })
 
-    by_id = {c["num_iid"]: c for c in result["final"]}
-    assert by_id["low-service"]["score"] == 0
-    assert by_id["low-service"]["recommendationLevel"] == "不推荐"
-    assert by_id["no-invoice"]["score"] > 0
-    assert by_id["no-invoice"]["rejection"] is None
-    assert "invoiceSupport" not in by_id["no-invoice"]
+    final_by_id = {c["num_iid"]: c for c in result["final"]}
+    rejected_by_id = {c["num_iid"]: c for c in result["rejected"]}
+    assert rejected_by_id["low-service"]["score"] == 0
+    assert rejected_by_id["low-service"]["recommendationLevel"] == "不推荐"
+    assert final_by_id["no-invoice"]["score"] > 0
+    assert final_by_id["no-invoice"]["rejection"] is None
+    assert "invoiceSupport" not in final_by_id["no-invoice"]
     assert result["rejected_reasons"]["综合服务分 < 3.0"] == 1
     assert "不能开发票" not in result["rejected_reasons"]
 
@@ -182,6 +219,138 @@ def test_spec_boundary_does_not_match_750g_for_75g() -> None:
 
     assert rules.spec_in_text("75g", "红鸟液体鞋油75g") is True
     assert rules.spec_in_text("75g", "红鸟液体鞋油750g") is False
+    assert rules.spec_in_text("650g", "清扬洗发水650ml") is True
+
+
+def test_keyword_builder_does_not_emit_bare_english_alias_query() -> None:
+    mod = _load_keyword_module()
+
+    kw = mod.build_keywords(
+        "清扬洗发水控油冰爽薄荷活力止痒韧发650克洗发水 男士深层净澈 650g 650ml",
+        known_brand="清扬",
+    )
+
+    assert kw.to_query() == "清扬 洗发水 薄荷 650g"
+    assert "CLEAR" not in kw.extra_queries()
+    assert "CLEAR 洗发水 650g" in kw.extra_queries()
+
+
+def test_relevance_filters_wrong_brand_category_and_sku() -> None:
+    rules = _load_rules_module()
+    result = rules.run_pipeline({
+        "target": {
+            "title": "清扬洗发水控油冰爽薄荷活力止痒韧发650克洗发水 男士深层净澈 650g 650ml",
+            "brand": "清扬",
+            "brand_aliases": ["清扬", "CLEAR"],
+            "category": "洗发水",
+            "variant": ["薄荷"],
+            "spec": "650g",
+            "buy_multiple": 3,
+        },
+        "candidates": [
+            {
+                "num_iid": "bag",
+                "title": "透明pvc自封袋首饰收纳袋塑料封口包装袋子",
+                "unitPrice": 0.03,
+                "compositeScore": 5,
+                "shopYear": 5,
+            },
+            {
+                "num_iid": "pantene",
+                "title": "潘婷洗发水5g小包袋装洗发露",
+                "unitPrice": 0.19,
+                "compositeScore": 5,
+                "shopYear": 5,
+            },
+            {
+                "num_iid": "clear-100g",
+                "title": "清扬男士去屑止痒洗发露活力运动薄荷型100克",
+                "unitPrice": 3.6,
+                "compositeScore": 5,
+                "shopYear": 5,
+            },
+            {
+                "num_iid": "clear-650",
+                "title": "清扬洗发水控油冰爽薄荷活力发650克洗发水批发",
+                "unitPrice": 37.5,
+                "compositeScore": 4.8,
+                "shopYear": 8,
+                "detail": {
+                    "min_num": 3,
+                    "num": 1498,
+                    "skus": {
+                        "sku": [
+                            {"properties_name": "净含量:650ml;规格类型:男士深层净澈", "quantity": 1498}
+                        ]
+                    },
+                },
+            },
+        ],
+    })
+
+    assert [item["num_iid"] for item in result["final"]] == ["clear-650"]
+    assert result["status"] == "召回不足"
+    rejected = {item["num_iid"]: item["rejection"] for item in result["rejected"]}
+    assert rejected["bag"] == "品牌不匹配"
+    assert rejected["pantene"] == "品牌不匹配"
+    assert rejected["clear-100g"] == "SKU不一致"
+
+
+def test_obvious_no_stock_is_rejected_but_unknown_stock_can_remain() -> None:
+    rules = _load_rules_module()
+    result = rules.run_pipeline({
+        "target": {
+            "title": "红鸟黑色液体鞋油75g",
+            "brand": "红鸟",
+            "category": "鞋油",
+            "variant": ["黑色"],
+            "spec": "75g",
+        },
+        "candidates": [
+            {
+                "num_iid": "zero-stock",
+                "title": "红鸟黑色液体鞋油75g批发",
+                "unitPrice": 2.8,
+                "compositeScore": 5,
+                "shopYear": 5,
+                "detail": {
+                    "skus": {
+                        "sku": [
+                            {"properties_name": "颜色:黑色;规格:75g", "quantity": 0}
+                        ]
+                    }
+                },
+            },
+            {
+                "num_iid": "unknown-stock",
+                "title": "红鸟黑色液体鞋油75g批发",
+                "unitPrice": 3.0,
+                "compositeScore": 5,
+                "shopYear": 5,
+            },
+        ],
+    })
+
+    assert [item["num_iid"] for item in result["final"]] == ["unknown-stock"]
+    rejected = {item["num_iid"]: item["rejection"] for item in result["rejected"]}
+    assert rejected["zero-stock"] in {"目标SKU无库存", "无库存"}
+
+
+def test_unsuitable_price_and_low_score_are_removed_from_final() -> None:
+    rules = _load_rules_module()
+    result = rules.run_pipeline({
+        "target": {"jd_price": 10},
+        "candidates": [
+            {"num_iid": "cheap", "title": "A", "unitPrice": 2, "compositeScore": 5, "shopYear": 5},
+            {"num_iid": "near-jd", "title": "B", "unitPrice": 10, "compositeScore": 5, "shopYear": 5},
+            {"num_iid": "low-score", "title": "C", "unitPrice": 9, "compositeScore": 5, "shopYear": 5},
+        ],
+    })
+
+    assert [item["num_iid"] for item in result["final"]] == ["cheap"]
+    rejected = {item["num_iid"]: item["rejection"] for item in result["rejected"]}
+    assert rejected["near-jd"] == "价格不低于京东"
+    assert rejected["low-score"] == "综合得分 < 60"
 
 
 def test_ecom_config_loads_private_section_without_exposing_values(tmp_path: Path) -> None:
@@ -279,6 +448,47 @@ def test_jd_product_parser_extracts_title_and_images() -> None:
     assert "https://img12.360buyimg.com/n1/jfs/t1/extra.jpg" in result["image_urls"]
 
 
+def test_jd_product_b2b_generic_falls_back_to_item_page(monkeypatch) -> None:
+    path = (
+        Path(__file__).parent.parent
+        / "skills"
+        / "ecom-best-source"
+        / "scripts"
+        / "jd_product.py"
+    )
+    spec = importlib.util.spec_from_file_location("jd_product_fallback", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    def fake_http(url: str, timeout: int) -> str:
+        if "b2b.jd.com" in url:
+            return """
+            <html><head>
+              <title>京东万商</title>
+              <meta property="og:image" content="//img12.360buyimg.com/imagetools/shell.png">
+            </head></html>
+            """
+        return """
+        <html><head>
+          <title>清扬洗发水控油冰爽薄荷650克,清扬（CLEAR）,,京东,网上购物</title>
+          <meta property="og:image" content="//img11.360buyimg.com/imagetools/placeholder.png">
+        </head>
+        <body>
+          <img src="//img10.360buyimg.com/n1/s720x720_jfs/t1/product.jpg">
+        </body></html>
+        """
+
+    monkeypatch.setattr(module, "_http_get_text", fake_http)
+
+    result = module.fetch_product("https://b2b.jd.com/goods/goods-detail/10117266111930", timeout=1)
+
+    assert result["title"] == "清扬洗发水控油冰爽薄荷650克"
+    assert result["item_id"] == "10117266111930"
+    assert result["main_image_url"] == "https://img10.360buyimg.com/n1/s720x720_jfs/t1/product.jpg"
+
+
 def test_data_source_jwt_hs256_shape() -> None:
     mod = _load_data_sources_module()
 
@@ -286,3 +496,161 @@ def test_data_source_jwt_hs256_shape() -> None:
 
     assert token.count(".") == 2
     assert "=" not in token
+
+
+def test_sourcing_pipeline_writes_final_csv_with_bom(tmp_path: Path) -> None:
+    mod = _load_pipeline_module()
+    jd_product = tmp_path / "jd_product.json"
+    candidates = tmp_path / "candidates.json"
+    output = tmp_path / "找货_红鸟鞋油75g_20260615.csv"
+
+    jd_product.write_text(
+        """
+{
+  "title": "红鸟 RED BIRD 黑色液体鞋油 75g",
+  "jd_url": "https://item.jd.com/100012345678.html",
+  "item_id": "100012345678",
+  "main_image_url": "https://img.example/jd.jpg"
+}
+""",
+        encoding="utf-8",
+    )
+    candidates.write_text(
+        """
+{
+  "candidates": [
+    {
+      "num_iid": "1001",
+      "title": "红鸟黑色液体鞋油75g批发",
+      "detail_url": "https://detail.1688.com/offer/1001.html",
+      "unitPrice": 3.2,
+      "compositeScore": 4.8,
+      "shopYear": 8,
+      "MOQ": 3,
+      "shopName": "义乌红鸟日化",
+      "sources": ["text", "image"],
+      "detail": {
+        "num": 30,
+        "skus": {
+          "sku": [
+            {"properties_name": "颜色:黑色;规格:75g", "quantity": 12, "price": 3.2}
+          ]
+        }
+      }
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+
+    summary = mod.run_from_files(
+        jd_product_path=str(jd_product),
+        candidates_path=str(candidates),
+        merged_input_path=None,
+        output_path=str(output),
+        buy_multiple=3,
+        target_count=5,
+    )
+
+    assert summary["final_count"] == 1
+    assert summary["top3"][0]["link"] == "https://detail.1688.com/offer/1001.html"
+    assert summary["top3"][0]["stock"] == "匹配SKU库存 12"
+    raw = output.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")
+    text = output.read_text(encoding="utf-8-sig")
+    assert "红鸟黑色液体鞋油75g批发" in text
+    assert "https://detail.1688.com/offer/1001.html" in text
+    assert "SKU库存" in text
+
+
+def test_sourcing_pipeline_confirms_final_details_and_removes_no_stock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mod = _load_pipeline_module()
+    jd_product = tmp_path / "jd_product.json"
+    candidates = tmp_path / "candidates.json"
+    output = tmp_path / "找货_红鸟鞋油75g_20260617.csv"
+
+    jd_product.write_text(
+        """
+{
+  "title": "红鸟 RED BIRD 黑色液体鞋油 75g",
+  "jd_url": "https://item.jd.com/100012345678.html",
+  "item_id": "100012345678",
+  "main_image_url": "https://img.example/jd.jpg"
+}
+""",
+        encoding="utf-8",
+    )
+    candidates.write_text(
+        """
+{
+  "candidates": [
+    {
+      "num_iid": "1001",
+      "title": "红鸟黑色液体鞋油75g批发",
+      "detail_url": "https://detail.1688.com/offer/1001.html",
+      "unitPrice": 2.9,
+      "compositeScore": 5,
+      "shopYear": 5,
+      "MOQ": 3,
+      "shopName": "无货店"
+    },
+    {
+      "num_iid": "1002",
+      "title": "红鸟黑色液体鞋油75g批发",
+      "detail_url": "https://detail.1688.com/offer/1002.html",
+      "unitPrice": 3.2,
+      "compositeScore": 5,
+      "shopYear": 5,
+      "MOQ": 3,
+      "shopName": "有货店"
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+
+    calls: list[str] = []
+
+    class FakeClient:
+        def item_get(self, num_iid: str) -> dict[str, object]:
+            calls.append(num_iid)
+            if num_iid == "1001":
+                return {
+                    "price": 2.9,
+                    "num": 0,
+                    "skus": {"sku": [{"properties_name": "颜色:黑色;规格:75g", "quantity": 0}]},
+                }
+            return {
+                "price": 3.2,
+                "num": 18,
+                "skus": {"sku": [{"properties_name": "颜色:黑色;规格:75g", "quantity": 18}]},
+            }
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(mod, "_make_data_client", lambda: FakeClient())
+
+    summary = mod.run_from_files(
+        jd_product_path=str(jd_product),
+        candidates_path=str(candidates),
+        merged_input_path=None,
+        output_path=str(output),
+        known_brand="红鸟",
+        buy_multiple=3,
+        target_count=1,
+    )
+
+    assert calls == ["1001", "1002"]
+    assert summary["confirmation"]["confirmed"] == 2
+    assert summary["final_count"] == 1
+    assert summary["top3"][0]["link"] == "https://detail.1688.com/offer/1002.html"
+    assert summary["top3"][0]["stock"] == "匹配SKU库存 18"
+    text = output.read_text(encoding="utf-8-sig")
+    assert "有货店" in text
+    assert "无货店" not in text

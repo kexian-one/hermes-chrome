@@ -29,6 +29,14 @@ REMOVED_DIMENSION_FIELDS = {
     "invoice_rate",
 }
 
+CATEGORY_ALIASES = {
+    "洗发水": ["洗发水", "洗发露", "洗头膏", "洗发膏"],
+    "沐浴露": ["沐浴露", "沐浴乳"],
+    "护发素": ["护发素", "护发乳"],
+    "洗衣液": ["洗衣液", "洗衣凝珠"],
+    "鞋油": ["鞋油", "鞋蜡", "鞋膏"],
+}
+
 
 @dataclass
 class Candidate:
@@ -99,7 +107,10 @@ def run_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
         return _result("无供给", target, [], [], target_count)
 
     score_candidates(candidates, weights)
-    final = sorted(candidates, key=lambda c: c.score, reverse=True)[:target_count]
+    eligible = [c for c in candidates if not c.rejection]
+    final = sorted(eligible, key=lambda c: c.score, reverse=True)[:target_count]
+    final_ids = {id(c) for c in final}
+    rest = [c for c in candidates if id(c) not in final_ids]
 
     if not final:
         status = "无供给"
@@ -107,7 +118,7 @@ def run_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
         status = "召回不足"
     else:
         status = "ok"
-    return _result(status, target, final, candidates[target_count:], target_count)
+    return _result(status, target, final, rest, target_count)
 
 
 def candidate_from_dict(item: dict[str, Any], target: dict[str, Any]) -> Candidate:
@@ -160,12 +171,17 @@ def candidate_from_dict(item: dict[str, Any], target: dict[str, Any]) -> Candida
     )
     if not c.sku_match_level:
         c.sku_match_level = infer_sku_match_level(c, target)
+    apply_relevance_hard_filters(c, target)
     apply_original_hard_downgrades(c, target)
     return c
 
 
 def score_candidates(candidates: list[Candidate], weights: dict[str, float]) -> None:
-    prices = [c.unit_price for c in candidates if c.unit_price and c.unit_price > 0]
+    prices = [
+        c.unit_price
+        for c in candidates
+        if not c.rejection and c.unit_price and c.unit_price > 0
+    ]
     p_min = min(prices) if prices else 0.0
     p_max = max(prices) if prices else 0.0
     p_range = p_max - p_min if p_max > p_min else 0.0
@@ -186,16 +202,78 @@ def score_candidates(candidates: list[Candidate], weights: dict[str, float]) -> 
             c.recommendation_level = "不推荐"
         else:
             c.recommendation_level = recommendation_level(c.score)
+            apply_price_hard_filters(c)
+
+
+def apply_relevance_hard_filters(c: Candidate, target: dict[str, Any]) -> None:
+    if not _target_has_relevance_signal(target):
+        return
+    text = _normalize_match_text(" ".join([c.title, c.sku_name, _flatten_text(c.detail)]))
+    brand_aliases = _target_brand_aliases(target)
+    if brand_aliases and not any(_normalize_match_text(alias) in text for alias in brand_aliases):
+        _set_rejection(c, "品牌不匹配")
+        return
+
+    category = str(target.get("category") or "").strip()
+    if category and not any(_normalize_match_text(alias) in text for alias in _category_aliases(category)):
+        _set_rejection(c, "品类不匹配")
+        return
+
+    if _target_has_sku_signal(target) and c.sku_match_level in {"SKU不一致", "不一致"}:
+        _set_rejection(c, "SKU不一致")
 
 
 def apply_original_hard_downgrades(c: Candidate, target: dict[str, Any]) -> None:
     if c.composite_score is not None and c.composite_score < 3.0:
-        c.rejection = "综合服务分 < 3.0"
+        _set_rejection(c, "综合服务分 < 3.0")
     if c.shop_year and c.shop_year < 1:
-        c.rejection = "入驻年限 < 1 年"
+        _set_rejection(c, "入驻年限 < 1 年")
     buy_multiple = _to_int(target.get("buy_multiple") or target.get("batchQuantity") or target.get("purchaseMultiple"))
     if buy_multiple > 0 and c.moq > buy_multiple * 10:
         c.warnings.append("MOQ 过高")
+    apply_stock_hard_filters(c)
+
+
+def apply_price_hard_filters(c: Candidate) -> None:
+    if c.unit_price is None or c.unit_price <= 0:
+        _set_rejection(c, "价格缺失")
+        c.score = 0.0
+        c.recommendation_level = "不推荐"
+        return
+    if c.jd_price and c.jd_price > 0 and c.unit_price >= c.jd_price:
+        _set_rejection(c, "价格不低于京东")
+        c.score = 0.0
+        c.recommendation_level = "不推荐"
+        return
+    if c.score < 60:
+        _set_rejection(c, "综合得分 < 60")
+        c.score = 0.0
+        c.recommendation_level = "不推荐"
+
+
+def apply_stock_hard_filters(c: Candidate) -> None:
+    detail = c.detail if isinstance(c.detail, dict) else {}
+    sku_rows = _detail_sku_rows(detail)
+    if sku_rows:
+        matched = _matching_sku_rows(sku_rows, c.sku_name)
+        rows = matched or sku_rows
+        explicit_quantities = [
+            _to_int(row.get(key))
+            for row in rows
+            for key in ("quantity", "amountOnSale", "num")
+            if key in row and row.get(key) not in (None, "")
+        ]
+        if explicit_quantities and max(explicit_quantities) <= 0:
+            _set_rejection(c, "目标SKU无库存" if matched else "无库存")
+            return
+
+    explicit_totals = [
+        _to_int(detail.get(key))
+        for key in ("num", "stock", "quantity")
+        if key in detail and detail.get(key) not in (None, "")
+    ]
+    if explicit_totals and max(explicit_totals) <= 0:
+        _set_rejection(c, "无库存")
 
 
 def infer_sku_match_level(c: Candidate, target: dict[str, Any]) -> str:
@@ -230,8 +308,10 @@ def spec_in_text(spec: str, text: str) -> bool:
     match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([a-zA-Z\u4e00-\u9fff]+)\s*", spec)
     if not match:
         return spec in text
-    value, unit = match.group(1), re.escape(match.group(2))
-    return re.search(rf"(?<![\d.]){re.escape(value)}\s*{unit}(?![\d.])", text, re.IGNORECASE) is not None
+    value, unit = match.group(1), match.group(2)
+    units = _unit_aliases(unit)
+    unit_pattern = "|".join(re.escape(u) for u in units)
+    return re.search(rf"(?<![\d.]){re.escape(value)}\s*(?:{unit_pattern})(?![\d.])", text, re.IGNORECASE) is not None
 
 
 def _price_score(unit_price: float | None, p_max: float, p_range: float) -> float:
@@ -246,6 +326,57 @@ def _service_score(composite_score: float | None) -> float:
     if composite_score is None:
         return 0.0
     return max(0.0, min(100.0, composite_score * 20.0))
+
+
+def _target_brand_aliases(target: dict[str, Any]) -> list[str]:
+    raw = [target.get("brand"), *(target.get("brand_aliases") or [])]
+    out = []
+    seen = set()
+    for value in raw:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def _target_has_relevance_signal(target: dict[str, Any]) -> bool:
+    return bool(
+        _target_brand_aliases(target)
+        or str(target.get("category") or "").strip()
+        or _target_has_sku_signal(target)
+    )
+
+
+def _target_has_sku_signal(target: dict[str, Any]) -> bool:
+    return bool(
+        str(target.get("selected_sku") or target.get("skuName") or target.get("spec") or "").strip()
+        or [v for v in (target.get("variant") or []) if v]
+    )
+
+
+def _category_aliases(category: str) -> list[str]:
+    return CATEGORY_ALIASES.get(category, [category])
+
+
+def _normalize_match_text(value: str) -> str:
+    return re.sub(r"\s+", "", (value or "").lower())
+
+
+def _set_rejection(c: Candidate, reason: str) -> None:
+    if not c.rejection:
+        c.rejection = reason
+
+
+def _unit_aliases(unit: str) -> list[str]:
+    normalized = unit.lower()
+    if normalized in {"g", "克", "ml", "毫升"}:
+        return ["g", "克", "ml", "毫升"]
+    if normalized in {"kg", "千克", "公斤"}:
+        return ["kg", "千克", "公斤"]
+    if normalized in {"l", "升"}:
+        return ["l", "L", "升"]
+    return [unit]
 
 
 def _result(
@@ -283,6 +414,20 @@ def _detail_sku_rows(detail: dict[str, Any]) -> list[dict[str, Any]]:
     skus = detail.get("skus") or detail.get("sku") or {}
     rows = skus.get("sku") or skus.get("list") or [] if isinstance(skus, dict) else skus
     return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def _matching_sku_rows(rows: list[dict[str, Any]], sku_name: str) -> list[dict[str, Any]]:
+    if not sku_name:
+        return []
+    needles = [part.strip() for part in re.split(r"[;,\s/]+", sku_name) if part.strip()]
+    if not needles:
+        return []
+    out = []
+    for row in rows:
+        text = " ".join(str(row.get(k) or "") for k in ("properties_name", "name", "skuName"))
+        if all(needle in text for needle in needles):
+            out.append(row)
+    return out
 
 
 def _nested(data: dict[str, Any], *keys: str) -> Any:

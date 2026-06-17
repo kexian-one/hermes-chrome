@@ -23,6 +23,7 @@ from agent.skill_loader import SkillRegistry
 # (not iteration count) — at that scale move to per-batch worker spawn,
 # not just raising this cap further.
 MAX_ITERATIONS = 400
+_ECOM_REQUIRED_OUTPUT_RETRIES = 2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,6 +90,44 @@ FREEFORM_SYSTEM_PROMPT = _WORKER_OPERATOR_GUIDANCE + """
 3. javascript_tool / read_page 看页面状态
 4. 按用户目标采取下一步行动
 5. 任务完成后,如果有结构化结果,用 write_file 保存"""
+
+
+def _required_outputs_ready(label: str) -> bool:
+    """Return whether a skill has produced the artifacts required to finish.
+
+    Most skills are open-ended, so only ecom-best-source has a hard guard here:
+    it must write a final CSV directly in WORKER_OUTPUT_DIR. Scratch JSON under
+    .ecom-scratch is intentionally not enough.
+    """
+    if label != "ecom-best-source":
+        return True
+    raw = os.environ.get("WORKER_OUTPUT_DIR", "").strip()
+    if not raw:
+        return True
+    output_dir = Path(raw)
+    try:
+        return any(
+            p.is_file()
+            and p.suffix.lower() == ".csv"
+            and not p.name.startswith(".")
+            for p in output_dir.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _should_stop_ecom_after_csv(label: str, tool_calls: list[ToolCall]) -> bool:
+    """Stop ecom-best-source once its final CSV exists.
+
+    After the deterministic sourcing pipeline writes the CSV, extra tool calls
+    are usually redundant verification: reading rules, reading the CSV, or
+    rerunning scoring scripts. The master uploads artifacts from the output dir,
+    so the worker can finish without letting those calls burn another minute or
+    overwrite the already-good CSV.
+    """
+    if label != "ecom-best-source" or not tool_calls:
+        return False
+    return _required_outputs_ready(label)
 
 
 async def _describe_image_blocks(
@@ -176,6 +215,7 @@ async def _run_chat_loop(
     # in content text.
     extension_disconnected = False
     productive_calls = 0
+    missing_required_output_retries = 0
 
     for iteration in range(MAX_ITERATIONS):
         try:
@@ -185,6 +225,14 @@ async def _run_chat_loop(
             return 3
 
         if response.tool_calls:
+            if _should_stop_ecom_after_csv(label, response.tool_calls):
+                tool_names = ", ".join(tc.name for tc in response.tool_calls)
+                log.info(
+                    "worker=%s label=%s final CSV exists; stopping before post-completion tool calls: %s",
+                    config.worker_id, label, tool_names,
+                )
+                return 0
+
             assistant_msg: dict = {
                 "role": "assistant",
                 "content": response.text,
@@ -266,6 +314,33 @@ async def _run_chat_loop(
                     config.worker_id, label,
                 )
                 return 2
+            if not _required_outputs_ready(label):
+                missing_required_output_retries += 1
+                if missing_required_output_retries > _ECOM_REQUIRED_OUTPUT_RETRIES:
+                    log.error(
+                        "worker=%s label=%s stopped without required CSV output — exiting skill-failed",
+                        config.worker_id, label,
+                    )
+                    return 1
+                log.warning(
+                    "worker=%s label=%s stopped before required CSV output; asking LLM to continue",
+                    config.worker_id, label,
+                )
+                messages.append({
+                    "role": "assistant",
+                    "content": response.text or "",
+                })
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "任务还没有完成。ecom-best-source 必须在任务输出目录直接写出 "
+                        "1 个最终 CSV 文件，文件名形如 `找货_<商品简写>_<YYYYMMDD>.csv`。"
+                        "中间 JSON / scratch 文件不算最终产出。请继续执行召回、筛选，优先用 "
+                        "run_ecom_script 调用 `sourcing_pipeline.py --jd-product ... --candidates ... "
+                        "--output ...csv` 生成最终 CSV；脚本成功后直接用 stdout 的 top3 总结，不要再重跑规则。"
+                    ),
+                })
+                continue
             log.info("LLM finished. worker=%s label=%s", config.worker_id, label)
             return 0
         else:

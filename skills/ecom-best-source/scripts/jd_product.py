@@ -47,6 +47,12 @@ class ProductHTMLParser(HTMLParser):
 def fetch_product(url: str, timeout: int = 30) -> dict[str, Any]:
     text = _http_get_text(url, timeout)
     parsed = parse_product_html(text, url)
+    item_id = str(parsed.get("item_id") or _item_id(url) or "")
+    if item_id and _is_generic_result(parsed):
+        parsed = _best_product_result([
+            parsed,
+            *_fetch_fallback_products(item_id, timeout),
+        ])
     if not parsed.get("title") and not parsed.get("main_image_url"):
         raise RuntimeError("could not extract JD title or image from page")
     return parsed
@@ -76,12 +82,52 @@ def parse_product_html(text: str, url: str) -> dict[str, Any]:
     images.extend(JD_IMAGE_RE.findall(text))
     image_urls = _unique(_normalize_image_url(x) for x in images if x)
 
+    image_urls = _sort_image_urls(image_urls)
+
     return {
         "title": title,
         "jd_url": url,
         "item_id": _item_id(url) or _item_id(text),
         "main_image_url": image_urls[0] if image_urls else "",
         "image_urls": image_urls[:12],
+    }
+
+
+def _fetch_fallback_products(item_id: str, timeout: int) -> list[dict[str, Any]]:
+    products = []
+    for url in (
+        f"https://item.jd.com/{item_id}.html",
+        f"https://item.m.jd.com/product/{item_id}.html",
+    ):
+        try:
+            products.append(parse_product_html(_http_get_text(url, timeout), url))
+        except Exception:
+            continue
+    return products
+
+
+def _best_product_result(products: list[dict[str, Any]]) -> dict[str, Any]:
+    best_title = ""
+    best_url = ""
+    item_id = ""
+    images: list[str] = []
+    for product in products:
+        title = str(product.get("title") or "").strip()
+        if _title_score(title) > _title_score(best_title):
+            best_title = title
+            best_url = str(product.get("jd_url") or "")
+        if not item_id:
+            item_id = str(product.get("item_id") or "")
+        raw_images = product.get("image_urls") or []
+        if isinstance(raw_images, list):
+            images.extend(str(u) for u in raw_images if u)
+    images = _sort_image_urls(_unique(images))
+    return {
+        "title": best_title,
+        "jd_url": best_url or (products[0].get("jd_url") if products else ""),
+        "item_id": item_id,
+        "main_image_url": images[0] if images else "",
+        "image_urls": images[:12],
     }
 
 
@@ -135,6 +181,8 @@ def _clean_title(value: str) -> str:
     text = html.unescape(value or "")
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"[-_]\s*(京东|JD\.COM|京东商城).*$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"[,，]\s*[^,，]{1,40}[,，]*\s*京东.*$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"[,，]\s*京东.*$", "", text, flags=re.IGNORECASE).strip()
     return text
 
 
@@ -144,6 +192,7 @@ def _normalize_image_url(value: str) -> str:
         url = "https:" + url
     url = re.sub(r"!(?:q\d+|cc_\d+x\d+|.*?\.webp).*$", "", url)
     url = re.sub(r"\.webp$", "", url)
+    url = url.rstrip(")")
     return url
 
 
@@ -160,6 +209,43 @@ def _unique(values) -> list[str]:
             seen.add(value)
             out.append(value)
     return out
+
+
+def _is_generic_result(product: dict[str, Any]) -> bool:
+    return _title_score(str(product.get("title") or "")) <= 0
+
+
+def _title_score(title: str) -> int:
+    text = (title or "").strip()
+    if not text or text in {"京东", "京东万商", "京东商城", "JD.COM"}:
+        return 0
+    score = min(len(text), 80)
+    if any(word in text for word in ("网上购物", "京东", "登录")):
+        score -= 20
+    if "..." in text or "…" in text:
+        score -= 30
+    if re.search(r"[\u4e00-\u9fff].*(g|ml|kg|L|克|毫升|瓶|箱)", text, re.IGNORECASE):
+        score += 20
+    return score
+
+
+def _sort_image_urls(urls: list[str]) -> list[str]:
+    return sorted(urls, key=_image_score, reverse=True)
+
+
+def _image_score(url: str) -> int:
+    score = 0
+    if re.search(r"/n\d+/", url):
+        score += 50
+    if re.search(r"s\d+x\d+", url):
+        score += 20
+    if "/img/" in url:
+        score += 5
+    if any(part in url for part in ("/jdphoto/", "/devfe/", "/imagetools/")):
+        score -= 30
+    if re.search(r"\.(jpg|jpeg|png)$", url, re.IGNORECASE):
+        score += 2
+    return score
 
 
 def main() -> int:

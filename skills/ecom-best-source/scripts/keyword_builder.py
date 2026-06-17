@@ -40,6 +40,7 @@ BRAND_ALIAS_EXPAND: dict[str, list[str]] = {
     "飘柔": ["飘柔", "Rejoice", "飘柔Rejoice"],
     "海飞丝": ["海飞丝", "Head & Shoulders", "海飞丝Head&Shoulders"],
     "潘婷": ["潘婷", "Pantene", "潘婷Pantene"],
+    "清扬": ["清扬", "CLEAR"],
 }
 
 CATEGORY_WORDS = [
@@ -79,7 +80,7 @@ FLAVOR_WORDS = [
 ]
 
 SPEC_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(kg|g|mg|ml|L|斤|两|片|粒|包|瓶|箱|双|个|寸|cm|mm|m)",
+    r"(\d+(?:\.\d+)?)\s*(kg|g|mg|ml|L|克|毫升|斤|两|片|粒|包|瓶|箱|双|个|寸|cm|mm|m)",
     re.IGNORECASE,
 )
 BRAND_CN_EN_RE = re.compile(r"^([\u4e00-\u9fff]{1,6})[（(]([A-Za-z][A-Za-z &]*)[)）]")
@@ -110,13 +111,19 @@ class Keywords:
 
     def extra_queries(self) -> list[str]:
         out = []
+        context = [x for x in [self.category, self.spec] if x]
         if self.brand:
-            out.append(self.brand)
+            out.append(" ".join([self.brand, *context]) if context else self.brand)
         for alias in self.brand_aliases:
-            if alias and alias != self.brand and any(c.isascii() and c.isalpha() for c in alias):
-                out.append(alias)
+            if not alias or alias == self.brand:
+                continue
+            has_ascii_alpha = any(c.isascii() and c.isalpha() for c in alias)
+            if has_ascii_alpha and not self.category:
+                continue
+            out.append(" ".join([alias, *context]) if context else alias)
         seen = set()
-        return [q for q in out if not (q in seen or seen.add(q))]
+        primary = self.to_query()
+        return [q for q in out if q != primary and not (q in seen or seen.add(q))]
 
     def to_target(self, title: str, **extra: Any) -> dict[str, Any]:
         return {
@@ -200,8 +207,17 @@ def _extract_spec(title: str) -> str | None:
     if not match:
         return None
     value = match.group(1)
-    unit = match.group(2)
+    unit = _normalize_unit(match.group(2))
     return f"{value}{unit}"
+
+
+def _normalize_unit(unit: str) -> str:
+    normalized = unit.lower()
+    return {
+        "克": "g",
+        "毫升": "ml",
+        "l": "L",
+    }.get(normalized, normalized)
 
 
 def _uniq(values: list[str]) -> list[str]:
@@ -218,13 +234,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build ecom-best-source keywords from a JD title")
     parser.add_argument("--title", required=True)
     parser.add_argument("--known-brand")
+    parser.add_argument("--output", help="Output JSON path")
     args = parser.parse_args()
     kw = build_keywords(args.title, args.known_brand)
-    print(json.dumps({
+    text = json.dumps({
         **kw.to_target(args.title),
         "query": kw.to_query(),
         "extra_queries": kw.extra_queries(),
-    }, ensure_ascii=False, indent=2))
+    }, ensure_ascii=False, indent=2)
+    if args.output:
+        from pathlib import Path
+
+        Path(args.output).write_text(text + "\n", encoding="utf-8")
+    else:
+        print(text)
     return 0
 
 
