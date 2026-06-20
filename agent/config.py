@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -17,6 +18,14 @@ class LLMSettings:
     base_url: str
     model: str
     api_key: str
+    provider: str = "openai"
+    extra_body: dict[str, Any] | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    reasoning_effort: str | None = None
+    mcp_server: str | None = None
+    mcp_tool: str | None = None
+    mcp_server_config: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -188,15 +197,58 @@ def load_config_file(path: Path | None = None) -> dict:
     return data
 
 
-def _llm_from_dict(d: dict, label: str) -> LLMSettings:
+def _llm_from_dict(d: dict, label: str, root_config: dict | None = None) -> LLMSettings:
     for key in ("base_url", "model", "api_key"):
         if key not in d:
             raise KeyError(f"llm.{label}.{key} missing in config")
+    extra_body = d.get("extra_body")
+    if extra_body is not None and not isinstance(extra_body, dict):
+        raise ValueError(f"llm.{label}.extra_body must be a mapping")
+    provider = str(d.get("provider") or "openai")
+    mcp_server = str(d.get("mcp_server") or "") or None
+    mcp_server_config = None
+    if provider == "zai_mcp":
+        if not mcp_server:
+            raise KeyError(f"llm.{label}.mcp_server missing for provider=zai_mcp")
+        servers = (root_config or {}).get("mcpServers") or {}
+        if not isinstance(servers, dict) or not isinstance(servers.get(mcp_server), dict):
+            raise KeyError(f"mcpServers.{mcp_server} missing in config")
+        mcp_server_config = dict(servers[mcp_server])
     return LLMSettings(
         base_url=str(d["base_url"]),
         model=str(d["model"]),
         api_key=str(d["api_key"]),
+        provider=provider,
+        extra_body=extra_body,
+        max_tokens=_optional_int(d.get("max_tokens"), f"llm.{label}.max_tokens"),
+        temperature=_optional_float(d.get("temperature"), f"llm.{label}.temperature"),
+        reasoning_effort=(
+            str(d["reasoning_effort"])
+            if d.get("reasoning_effort") is not None and str(d.get("reasoning_effort")).strip()
+            else None
+        ),
+        mcp_server=mcp_server,
+        mcp_tool=str(d.get("mcp_tool") or "analyze_image"),
+        mcp_server_config=mcp_server_config,
     )
+
+
+def _optional_int(value: Any, label: str) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"config '{label}' must be an integer, got {value!r}")
+
+
+def _optional_float(value: Any, label: str) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"config '{label}' must be a number, got {value!r}")
 
 
 def _load_llm_pair(config: dict | None = None) -> tuple[LLMSettings, LLMSettings]:
@@ -210,8 +262,8 @@ def _load_llm_pair(config: dict | None = None) -> tuple[LLMSettings, LLMSettings
     if "multimodal" not in llm or "reasoning" not in llm:
         raise KeyError("config 'llm' must contain both 'multimodal' and 'reasoning' sub-sections")
     return (
-        _llm_from_dict(llm["multimodal"], "multimodal"),
-        _llm_from_dict(llm["reasoning"], "reasoning"),
+        _llm_from_dict(llm["multimodal"], "multimodal", cfg),
+        _llm_from_dict(llm["reasoning"], "reasoning", cfg),
     )
 
 

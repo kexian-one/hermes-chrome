@@ -1100,6 +1100,13 @@ async def _knowledge_consolidation_loop(config: MasterConfig) -> None:
         base_url=llm_settings.base_url,
         api_key=llm_settings.api_key,
         model=llm_settings.model,
+        provider=llm_settings.provider,
+        extra_body=llm_settings.extra_body,
+        max_tokens=llm_settings.max_tokens,
+        temperature=llm_settings.temperature,
+        reasoning_effort=llm_settings.reasoning_effort,
+        mcp_server_config=llm_settings.mcp_server_config,
+        mcp_tool=llm_settings.mcp_tool,
     )
     store = KnowledgeStore(config.knowledge.root)
 

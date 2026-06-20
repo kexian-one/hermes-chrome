@@ -144,6 +144,12 @@ logger = __import__("logging").getLogger(__name__)
 # Non-greedy breaks on nesting. The "over-capture multiple JSON blocks"
 # concern Codex raised is rarer than nested-JSON cases.
 _JSON_RE = re.compile(r'\{.*\}', re.DOTALL)
+_URL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#@!$&'*+,;=%-]+")
+_ECOM_URL_RE = re.compile(
+    r"https?://(?:item\.jd\.com|b2b\.jd\.com|3\.cn)/[A-Za-z0-9._~:/?#@!$&'*+,;=%-]+",
+    re.IGNORECASE,
+)
+_WORKER_ID_RE = re.compile(r"\bb([1-6])\b", re.IGNORECASE)
 
 
 def _format_recent_context(recent_turns: list[tuple[str, str, str]]) -> str:
@@ -188,7 +194,10 @@ async def route(
         args = data.get("args", {})
         if not isinstance(args, dict):
             args = {}
-        return IntentDispatch(intent=intent, args=args)
+        dispatch = IntentDispatch(intent=intent, args=args)
+        _recover_ecom_dispatch(dispatch, text)
+        _recover_ecom_task_url(dispatch, text)
+        return dispatch
     except Exception as exc:
         logger.warning("NLU route failed (returning unknown): %s: %s", type(exc).__name__, exc)
         return IntentDispatch(intent=Intent.UNKNOWN, args={})
@@ -206,3 +215,36 @@ def _parse_json(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
     return {"intent": "unknown", "args": {}}
+
+
+def _recover_ecom_task_url(dispatch: IntentDispatch, source_text: str) -> None:
+    """Keep JD URLs in ecom tasks even when the classifier summarizes them away."""
+    if dispatch.intent != Intent.RUN_NOW:
+        return
+    if dispatch.args.get("skill") != "ecom-best-source":
+        return
+    task = str(dispatch.args.get("task") or "").strip()
+    if _ECOM_URL_RE.search(task) or _URL_RE.search(task):
+        return
+    match = _ECOM_URL_RE.search(source_text) or _URL_RE.search(source_text)
+    if not match:
+        return
+    recovered_url = match.group(0)
+    dispatch.args["task"] = f"{task} {recovered_url}".strip()
+
+
+def _recover_ecom_dispatch(dispatch: IntentDispatch, source_text: str) -> None:
+    if dispatch.intent not in {Intent.UNKNOWN, Intent.FREEFORM}:
+        return
+    if not _ECOM_URL_RE.search(source_text):
+        return
+    worker_match = _WORKER_ID_RE.search(source_text)
+    worker_id = f"b{worker_match.group(1)}" if worker_match else str(dispatch.args.get("worker_id") or "b1")
+    if not _WORKER_ID_RE.fullmatch(worker_id):
+        worker_id = "b1"
+    dispatch.intent = Intent.RUN_NOW
+    dispatch.args = {
+        "worker_id": worker_id.lower(),
+        "skill": "ecom-best-source",
+        "task": source_text.strip(),
+    }

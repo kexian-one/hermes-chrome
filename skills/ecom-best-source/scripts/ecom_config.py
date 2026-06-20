@@ -18,7 +18,6 @@ class EcomConfig:
     data_source: str
     onebound: dict[str, Any]
     alphashop_mcp: dict[str, Any]
-    ai: dict[str, dict[str, Any]]
 
     def apply_env(self) -> None:
         if self.onebound.get("key"):
@@ -29,10 +28,6 @@ class EcomConfig:
             os.environ["ALPHASHOP_AK"] = str(self.alphashop_mcp["ak"])
         if self.alphashop_mcp.get("sk"):
             os.environ["ALPHASHOP_SK"] = str(self.alphashop_mcp["sk"])
-        for scene, cfg in self.ai.items():
-            key = cfg.get("api_key")
-            if key:
-                os.environ[f"AI_KEY_{scene.upper()}"] = str(key)
 
     def masked_status(self) -> dict[str, Any]:
         return {
@@ -48,16 +43,6 @@ class EcomConfig:
                 "ak": _mask(self.alphashop_mcp.get("ak", "")),
                 "sk_configured": bool(self.alphashop_mcp.get("sk")),
                 "configured": bool(self.alphashop_mcp.get("ak") and self.alphashop_mcp.get("sk")),
-            },
-            "ai": {
-                scene: {
-                    "base_url": cfg.get("base_url", ""),
-                    "model": cfg.get("model", ""),
-                    "api_key": _mask(cfg.get("api_key", "")),
-                    "enabled": bool(cfg.get("enabled", True)),
-                    "configured": bool(cfg.get("api_key")),
-                }
-                for scene, cfg in self.ai.items()
             },
         }
 
@@ -75,7 +60,6 @@ def load_ecom_config(project_root: Path | None = None) -> EcomConfig:
         data_source=str(section.get("data_source") or "hybrid"),
         onebound=dict(section.get("onebound") or {}),
         alphashop_mcp=dict(section.get("alphashop_mcp") or {}),
-        ai={k: dict(v or {}) for k, v in dict(section.get("ai") or {}).items()},
     )
 
 

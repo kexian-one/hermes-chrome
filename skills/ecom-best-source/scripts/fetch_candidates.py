@@ -61,7 +61,7 @@ def main() -> int:
     parser.add_argument("--text-pages", type=int, default=2)
     parser.add_argument("--image-pages", type=int, default=1)
     parser.add_argument("--page-size", type=int, default=100)
-    parser.add_argument("--detail-top-k", type=int, default=5)
+    parser.add_argument("--detail-top-k", type=int, default=6)
     parser.add_argument("--data-source", choices=["onebound", "mcp", "hybrid"], help="Override config data_source")
     parser.add_argument("--output", help="Output JSON path")
     args = parser.parse_args()

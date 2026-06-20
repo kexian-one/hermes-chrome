@@ -209,7 +209,12 @@ async def run_bot(
         base_url=llm_settings.base_url,
         api_key=llm_settings.api_key,
         model=llm_settings.model,
+        provider=llm_settings.provider,
         extra_body={"thinking": {"type": "disabled"}},
+        max_tokens=2048,
+        temperature=0.0,
+        mcp_server_config=llm_settings.mcp_server_config,
+        mcp_tool=llm_settings.mcp_tool,
     )
 
     buffer = ConversationBuffer(max_per_chat=5)

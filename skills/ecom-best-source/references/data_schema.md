@@ -69,7 +69,7 @@
       "price": 0.7142857143,
       "composite_service": 0.2857142857
     },
-    "output": {"target_count": 5}
+    "output": {"target_count": 6}
   }
 }
 ```

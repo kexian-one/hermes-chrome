@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import csv
 import sys
 from pathlib import Path
 
@@ -353,6 +354,20 @@ def test_unsuitable_price_and_low_score_are_removed_from_final() -> None:
     assert rejected["low-score"] == "综合得分 < 60"
 
 
+def test_sourcing_rules_defaults_to_six_final_candidates() -> None:
+    rules = _load_rules_module()
+    result = rules.run_pipeline({
+        "target": {},
+        "candidates": [
+            {"num_iid": str(i), "title": f"商品{i}", "unitPrice": 3, "compositeScore": 5, "shopYear": 5}
+            for i in range(1, 8)
+        ],
+    })
+
+    assert result["stats"]["target_count"] == 6
+    assert result["stats"]["final_count"] == 6
+
+
 def test_ecom_config_loads_private_section_without_exposing_values(tmp_path: Path) -> None:
     mod = _load_ecom_config_module()
     (tmp_path / "config.yaml").write_text(
@@ -367,12 +382,6 @@ ecom_best_source:
     endpoint: https://mcp.example/sse
     ak: alpha-ak-secret
     sk: alpha-sk-secret
-  ai:
-    matcher:
-      base_url: https://llm.example/v1
-      model: model-x
-      api_key: ai-key-secret
-      enabled: true
 """,
         encoding="utf-8",
     )
@@ -382,10 +391,9 @@ ecom_best_source:
 
     assert status["onebound"]["configured"] is True
     assert status["alphashop_mcp"]["configured"] is True
-    assert status["ai"]["matcher"]["configured"] is True
     assert "secret" not in status["onebound"]["key"]
     assert "secret" not in status["alphashop_mcp"]["ak"]
-    assert "secret" not in status["ai"]["matcher"]["api_key"]
+    assert "ai" not in status
 
 
 def test_data_source_normalizes_and_merges_candidates() -> None:
@@ -398,6 +406,7 @@ def test_data_source_normalizes_and_merges_candidates() -> None:
         "detailUrl": "https://detail.1688.com/offer/123.html",
         "price": "3.20",
         "soldOut": "120",
+        "sellerName": "红鸟源头店",
     }, source="text")
     image_item = mod.normalize_candidate({
         "num_iid": "123",
@@ -412,6 +421,57 @@ def test_data_source_normalizes_and_merges_candidates() -> None:
     assert merged[0]["num_iid"] == "123"
     assert merged[0]["title"] == "红鸟黑色液体鞋油75g"
     assert merged[0]["sources"] == ["image", "text"]
+    assert merged[0]["shopName"] == "红鸟源头店"
+
+
+def test_data_source_merges_onebound_detail_enrichment() -> None:
+    mod = _load_data_sources_module()
+    merged = mod._merge_detail_enrichment(
+        {
+            "num_iid": "123",
+            "title": "MCP标题",
+            "skus": {"sku": [{"quantity": 8}]},
+            "seller_info": {"sid": "", "nick": ""},
+        },
+        {
+            "num_iid": "123",
+            "nick": "Onebound店铺",
+            "seller_info": {"sid": "seller-123", "nick": "Onebound店铺", "star": "5.0", "tpyear": "6"},
+        },
+    )
+
+    assert merged["title"] == "MCP标题"
+    assert merged["skus"]["sku"][0]["quantity"] == 8
+    assert merged["seller_info"]["sid"] == "seller-123"
+    assert merged["seller_info"]["nick"] == "Onebound店铺"
+    assert merged["seller_info"]["star"] == "5.0"
+    assert merged["seller_info"]["tpyear"] == "6"
+
+
+def test_sourcing_pipeline_shipping_text() -> None:
+    mod = _load_pipeline_module()
+
+    assert mod._shipping_text({"detail": {"freeDeliverFee": True}}) == "包邮"
+    assert mod._shipping_text({"detail": {"post_fee": 4}}) == "首费4"
+    assert mod._shipping_text({"detail": {"freightInfo": {"totalCost": 10.75}}}) == "10.75"
+    assert mod._shipping_text({"detail": {}}) == "待确认"
+
+
+def test_sourcing_pipeline_b9_summary_text_uses_first_link_and_all_shops() -> None:
+    mod = _load_pipeline_module()
+
+    text = mod._b9_summary_text({
+        "final": [
+            {"link": "https://detail.1688.com/offer/964004881912.html?source=kj_material_agent", "shopName": "天台县禹络百货店"},
+            {"link": "https://detail.1688.com/offer/2.html", "shopName": "济南市历城区蓓盈贸易商行"},
+            {"link": "https://detail.1688.com/offer/3.html", "shopName": "天台县禹络百货店"},
+        ]
+    })
+
+    assert text == (
+        "https://detail.1688.com/offer/964004881912.html?source=kj_material_agent"
+        "，天台县禹络百货店，济南市历城区蓓盈贸易商行"
+    )
 
 
 def test_jd_product_parser_extracts_title_and_images() -> None:
@@ -559,9 +619,28 @@ def test_sourcing_pipeline_writes_final_csv_with_bom(tmp_path: Path) -> None:
     raw = output.read_bytes()
     assert raw.startswith(b"\xef\xbb\xbf")
     text = output.read_text(encoding="utf-8-sig")
+    headers = text.splitlines()[0].split(",")
+    assert headers == [
+        "1688商品标题",
+        "价格(元)",
+        "邮费",
+        "起批数",
+        "规格匹配",
+        "SKU库存",
+        "店铺信息",
+        "综合服务分",
+        "经营年限",
+        "风险说明",
+        "1688链接",
+    ]
+    assert "排名" not in headers
+    assert "得分" not in headers
+    assert "推荐理由" not in headers
     assert "红鸟黑色液体鞋油75g批发" in text
     assert "https://detail.1688.com/offer/1001.html" in text
     assert "SKU库存" in text
+    rows = list(csv.reader(output.open(encoding="utf-8-sig")))
+    assert rows[8][1] == "https://detail.1688.com/offer/1001.html，义乌红鸟日化"
 
 
 def test_sourcing_pipeline_confirms_final_details_and_removes_no_stock(
@@ -604,9 +683,7 @@ def test_sourcing_pipeline_confirms_final_details_and_removes_no_stock(
       "detail_url": "https://detail.1688.com/offer/1002.html",
       "unitPrice": 3.2,
       "compositeScore": 5,
-      "shopYear": 5,
-      "MOQ": 3,
-      "shopName": "有货店"
+      "MOQ": 3
     }
   ]
 }
@@ -628,8 +705,13 @@ def test_sourcing_pipeline_confirms_final_details_and_removes_no_stock(
             return {
                 "price": 3.2,
                 "num": 18,
+                "seller_info": {"sid": "seller-1002", "nick": "详情店"},
                 "skus": {"sku": [{"properties_name": "颜色:黑色;规格:75g", "quantity": 18}]},
             }
+
+        def seller_info(self, sid: str) -> dict[str, object]:
+            assert sid == "seller-1002"
+            return {"sid": sid, "nick": "详情店", "star": "5.0", "tpyear": "6"}
 
         def close(self) -> None:
             pass
@@ -650,7 +732,88 @@ def test_sourcing_pipeline_confirms_final_details_and_removes_no_stock(
     assert summary["confirmation"]["confirmed"] == 2
     assert summary["final_count"] == 1
     assert summary["top3"][0]["link"] == "https://detail.1688.com/offer/1002.html"
+    assert summary["top3"][0]["shop"] == "详情店"
     assert summary["top3"][0]["stock"] == "匹配SKU库存 18"
     text = output.read_text(encoding="utf-8-sig")
-    assert "有货店" in text
+    assert "详情店" in text
+    assert ",5,6," in text
     assert "无货店" not in text
+
+
+def test_sourcing_pipeline_reconfirms_existing_sku_detail_when_seller_fields_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mod = _load_pipeline_module()
+    jd_product = tmp_path / "jd_product.json"
+    candidates = tmp_path / "candidates.json"
+    output = tmp_path / "找货_红鸟鞋油75g_20260620.csv"
+
+    jd_product.write_text(
+        """
+{
+  "title": "红鸟 RED BIRD 黑色液体鞋油 75g",
+  "jd_url": "https://item.jd.com/100012345678.html",
+  "item_id": "100012345678",
+  "main_image_url": "https://img.example/jd.jpg"
+}
+""",
+        encoding="utf-8",
+    )
+    candidates.write_text(
+        """
+{
+  "candidates": [
+    {
+      "num_iid": "1006",
+      "title": "红鸟黑色液体鞋油75g批发",
+      "detail_url": "https://detail.1688.com/offer/1006.html",
+      "unitPrice": 3.2,
+      "MOQ": 3,
+      "detail": {
+        "num": 18,
+        "skus": {"sku": [{"properties_name": "颜色:黑色;规格:75g", "quantity": 18}]}
+      }
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+
+    calls: list[str] = []
+
+    class FakeClient:
+        def item_get(self, num_iid: str) -> dict[str, object]:
+            calls.append(num_iid)
+            return {
+                "price": 3.2,
+                "num": 18,
+                "seller_info": {"sid": "seller-1006", "nick": "第六店"},
+                "skus": {"sku": [{"properties_name": "颜色:黑色;规格:75g", "quantity": 18}]},
+            }
+
+        def seller_info(self, sid: str) -> dict[str, object]:
+            assert sid == "seller-1006"
+            return {"sid": sid, "nick": "第六店", "star": "4.9", "tpyear": "7"}
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(mod, "_make_data_client", lambda: FakeClient())
+
+    summary = mod.run_from_files(
+        jd_product_path=str(jd_product),
+        candidates_path=str(candidates),
+        merged_input_path=None,
+        output_path=str(output),
+        known_brand="红鸟",
+        buy_multiple=3,
+        target_count=6,
+    )
+
+    assert calls == ["1006"]
+    assert summary["confirmation"]["confirmed"] == 1
+    text = output.read_text(encoding="utf-8-sig")
+    assert "第六店" in text
+    assert ",4.9,7," in text

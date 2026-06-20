@@ -118,6 +118,88 @@ async def test_route_run_now():
 
 
 @pytest.mark.asyncio
+async def test_route_ecom_preserves_jd_url_when_llm_summarizes_task():
+    llm = _mock_llm({
+        "intent": "run_now",
+        "args": {"worker_id": "b1", "skill": "ecom-best-source", "task": "要3"},
+    })
+    result = await route(
+        "@开票助手1号 [六神花露水 - 京东](https://item.jd.com/10159624742014.html) 要3",
+        llm,
+    )
+    assert result.intent == Intent.RUN_NOW
+    assert result.args["task"] == "要3 https://item.jd.com/10159624742014.html"
+
+
+@pytest.mark.asyncio
+async def test_route_ecom_does_not_duplicate_existing_task_url():
+    llm = _mock_llm({
+        "intent": "run_now",
+        "args": {
+            "worker_id": "b1",
+            "skill": "ecom-best-source",
+            "task": "要3 https://item.jd.com/10159624742014.html",
+        },
+    })
+    result = await route(
+        "@开票助手1号 [六神花露水 - 京东](https://item.jd.com/10159624742014.html) 要3",
+        llm,
+    )
+    assert result.args["task"] == "要3 https://item.jd.com/10159624742014.html"
+
+
+@pytest.mark.asyncio
+async def test_route_ecom_recovers_unknown_when_message_contains_jd_url():
+    llm = _mock_llm({"intent": "unknown", "args": {}})
+    text = "@开票助手1号 [六神花露水 - 京东](https://item.jd.com/10159624742014.html) 要3"
+    result = await route(text, llm)
+    assert result.intent == Intent.RUN_NOW
+    assert result.args == {
+        "worker_id": "b1",
+        "skill": "ecom-best-source",
+        "task": text,
+    }
+
+
+@pytest.mark.asyncio
+async def test_route_unknown_non_jd_url_stays_unknown():
+    llm = _mock_llm({"intent": "unknown", "args": {}})
+    result = await route("看一下 https://example.com/foo", llm)
+    assert result.intent == Intent.UNKNOWN
+    assert result.args == {}
+
+
+@pytest.mark.asyncio
+async def test_route_ecom_recovers_freeform_when_message_contains_jd_url():
+    llm = _mock_llm({
+        "intent": "freeform",
+        "args": {
+            "worker_id": "b1",
+            "task": "六神花露水 https://item.jd.com/10159624742014.html 要3",
+        },
+    })
+    text = "@开票助手1号 [六神花露水 - 京东](https://item.jd.com/10159624742014.html) 要3"
+    result = await route(text, llm)
+    assert result.intent == Intent.RUN_NOW
+    assert result.args == {
+        "worker_id": "b1",
+        "skill": "ecom-best-source",
+        "task": text,
+    }
+
+
+@pytest.mark.asyncio
+async def test_route_ecom_recovery_keeps_worker_from_freeform_args():
+    llm = _mock_llm({
+        "intent": "freeform",
+        "args": {"worker_id": "b3", "task": "https://item.jd.com/10159624742014.html 要3"},
+    })
+    result = await route("https://item.jd.com/10159624742014.html 要3", llm)
+    assert result.intent == Intent.RUN_NOW
+    assert result.args["worker_id"] == "b3"
+
+
+@pytest.mark.asyncio
 async def test_route_schedule_add():
     llm = _mock_llm({
         "intent": "schedule_add",

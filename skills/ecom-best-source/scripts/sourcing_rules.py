@@ -100,7 +100,7 @@ def run_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
     config = payload.get("config") or {}
     weights = dict(DEFAULT_WEIGHTS)
     weights.update(config.get("weights") or {})
-    target_count = int((config.get("output") or {}).get("target_count") or 5)
+    target_count = int((config.get("output") or {}).get("target_count") or 6)
     candidates = [candidate_from_dict(x, target) for x in payload.get("candidates") or []]
 
     if not candidates:
@@ -123,7 +123,8 @@ def run_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
 
 def candidate_from_dict(item: dict[str, Any], target: dict[str, Any]) -> Candidate:
     detail = item.get("detail") or {}
-    seller = item.get("seller_info") or item.get("sellerInfo") or {}
+    detail_seller = detail.get("seller_info") if isinstance(detail.get("seller_info"), dict) else {}
+    seller = item.get("seller_info") or item.get("sellerInfo") or detail_seller or {}
     num_iid = str(
         item.get("num_iid")
         or item.get("offerId")

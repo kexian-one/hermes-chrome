@@ -231,6 +231,21 @@ class HybridDataClient:
         return self._call_with_fallback("search_image", img_url, page=page, page_size=page_size)
 
     def item_get(self, num_iid: str) -> dict[str, Any]:
+        if self.mode == "hybrid" and self._mcp and self._ob:
+            detail: dict[str, Any] = {}
+            try:
+                detail = self._mcp.item_get(num_iid)
+            except Exception as exc:
+                log.warning("MCP item_get failed; fallback to onebound: %s", exc)
+                return self._ob.item_get(num_iid)
+            if _detail_needs_onebound_enrichment(detail):
+                try:
+                    onebound_detail = self._ob.item_get(num_iid)
+                except Exception as exc:
+                    log.warning("onebound item_get enrichment failed: %s", exc)
+                else:
+                    detail = _merge_detail_enrichment(detail, onebound_detail)
+            return detail
         return self._call_with_fallback("item_get", num_iid)
 
     def seller_info(self, sid: str) -> dict[str, Any]:
@@ -305,6 +320,7 @@ def normalize_candidate(item: dict[str, Any], source: str) -> dict[str, Any]:
         "detail_url": detail_url,
         "price": item.get("price") or item.get("promotion_price"),
         "sales": _to_int(item.get("sales") or item.get("soldOut") or item.get("sale")),
+        "shopName": _shop_name_from(item),
         "sources": sorted(set([source, *[str(s) for s in item.get("sources", []) if s]])),
     })
     return out
@@ -322,7 +338,7 @@ def merge_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         existing = merged[key]
         existing["sources"].update(item.get("sources") or [])
-        for field in ("price", "sales", "pic_url", "detail_url"):
+        for field in ("price", "sales", "pic_url", "detail_url", "shopName"):
             if not existing.get(field) and item.get(field):
                 existing[field] = item[field]
     out = []
@@ -359,6 +375,7 @@ def _normalize_mcp_search_item(raw: dict[str, Any]) -> dict[str, Any]:
         "detail_url": str(raw.get("detailUrl") or "").strip(),
         "price": raw.get("price"),
         "sales": _to_int(raw.get("soldOut")),
+        "shopName": _shop_name_from(raw),
     }
 
 
@@ -419,8 +436,51 @@ def _normalize_mcp_detail_response(payload: Any) -> dict[str, Any]:
         "price": sku_rows[0].get("price") if sku_rows else None,
         "skus": {"sku": sku_rows},
         "props": props,
-        "seller_info": {"sid": "", "nick": ""},
+        "seller_info": {
+            "sid": str(raw.get("sellerId") or raw.get("supplierId") or raw.get("memberId") or ""),
+            "nick": _shop_name_from(raw),
+        },
     }
+
+
+def _detail_needs_onebound_enrichment(detail: dict[str, Any]) -> bool:
+    if not detail:
+        return True
+    seller = detail.get("seller_info") if isinstance(detail.get("seller_info"), dict) else {}
+    has_sid = bool(seller.get("sid") or detail.get("sid") or detail.get("seller_id"))
+    has_shop = bool(_shop_name_from({"seller_info": seller, **detail}))
+    has_score = bool(
+        seller.get("star")
+        or seller.get("compositeScore")
+        or seller.get("serviceScore")
+        or _nested(detail, "tradeService", "compositeNewScore")
+    )
+    has_year = bool(seller.get("tpyear") or seller.get("shopYear") or detail.get("shopYear"))
+    return not (has_sid and has_shop and has_score and has_year)
+
+
+def _merge_detail_enrichment(base: dict[str, Any], enrichment: dict[str, Any]) -> dict[str, Any]:
+    if not enrichment:
+        return base
+    merged = dict(base)
+    for key, value in enrichment.items():
+        if key == "seller_info":
+            continue
+        if merged.get(key) in (None, "", [], {}):
+            merged[key] = value
+    base_seller = base.get("seller_info") if isinstance(base.get("seller_info"), dict) else {}
+    enrich_seller = enrichment.get("seller_info") if isinstance(enrichment.get("seller_info"), dict) else {}
+    seller = {**base_seller}
+    for key, value in enrich_seller.items():
+        if seller.get(key) in (None, "") and value not in (None, ""):
+            seller[key] = value
+    for key in ("sid", "nick", "title", "shopName", "companyName"):
+        value = enrichment.get(key)
+        if seller.get(key) in (None, "") and value not in (None, ""):
+            seller[key] = value
+    if seller:
+        merged["seller_info"] = seller
+    return merged
 
 
 class _MCPSessionRunner:
@@ -595,6 +655,43 @@ def _offer_id_from_url(url: str) -> str:
 
 def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
+
+
+def _shop_name_from(item: dict[str, Any]) -> str:
+    seller = item.get("seller_info") if isinstance(item.get("seller_info"), dict) else {}
+    seller_alt = item.get("sellerInfo") if isinstance(item.get("sellerInfo"), dict) else {}
+    candidates = [
+        item.get("shopName"),
+        item.get("shop_name"),
+        item.get("storeName"),
+        item.get("sellerName"),
+        item.get("supplierName"),
+        item.get("supplierLoginName"),
+        item.get("companyName"),
+        item.get("memberName"),
+        seller.get("title"),
+        seller.get("nick"),
+        seller.get("shopName"),
+        seller.get("companyName"),
+        seller_alt.get("title"),
+        seller_alt.get("nick"),
+        seller_alt.get("shopName"),
+        seller_alt.get("companyName"),
+    ]
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _nested(data: dict[str, Any], *keys: str) -> Any:
+    cur: Any = data
+    for key in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
 
 
 def _to_int(value: Any) -> int:

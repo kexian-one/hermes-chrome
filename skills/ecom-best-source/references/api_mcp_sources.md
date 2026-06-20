@@ -29,19 +29,9 @@ ecom_best_source:
     endpoint: https://mcp.alphashop.cn/sse
     ak: ...
     sk: ...
-  ai:
-    # APIMart OpenAI-compatible Chat Completions:
-    # POST https://api.apimart.ai/v1/chat/completions
-    # Authorization: Bearer <api_key>
-    # body: {model: "gpt-5.5", messages: [...]}
-    matcher:
-      base_url: https://api.apimart.ai/v1
-      model: gpt-5.5
-      api_key: ...
-      enabled: true
 ```
 
-脚本读取配置时使用 `scripts/ecom_config.py`。只允许输出 mask 后的状态，不要把明文 key 写入日志、报告或聊天回复。
+脚本读取配置时使用 `scripts/ecom_config.py`。只允许输出 mask 后的状态，不要把明文 key 写入日志、报告或聊天回复。大模型配置统一使用项目根 `llm` 段，不在 `ecom_best_source` 下单独配置。
 
 ## 可执行脚本
 

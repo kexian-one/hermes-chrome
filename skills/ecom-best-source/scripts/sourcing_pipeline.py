@@ -14,17 +14,15 @@ from sourcing_rules import run_pipeline
 
 
 CSV_HEADERS = [
-    "排名",
     "1688商品标题",
     "价格(元)",
+    "邮费",
     "起批数",
     "规格匹配",
     "SKU库存",
     "店铺信息",
     "综合服务分",
     "经营年限",
-    "得分",
-    "推荐理由",
     "风险说明",
     "1688链接",
 ]
@@ -39,7 +37,7 @@ def run_from_files(
     json_output_path: str | None = None,
     known_brand: str | None = None,
     buy_multiple: int | None = None,
-    target_count: int = 5,
+    target_count: int = 6,
 ) -> dict[str, Any]:
     payload = _load_pipeline_payload(
         jd_product_path=jd_product_path,
@@ -120,6 +118,7 @@ def _run_with_final_detail_confirmation(
                 errors.append(f"{num_iid}: {type(exc).__name__}: {str(exc)[:120]}")
                 continue
             if isinstance(detail, dict) and detail:
+                _enrich_detail_seller_info(client, detail, errors)
                 _merge_confirmed_detail(candidate, detail)
                 confirmed += 1
                 changed = True
@@ -156,12 +155,77 @@ def _needs_detail_confirmation(candidate: dict[str, Any]) -> bool:
     detail = candidate.get("detail") if isinstance(candidate.get("detail"), dict) else {}
     if not detail:
         return True
+    if not _has_shop_score_and_year(candidate):
+        return True
     if _detail_sku_rows(detail):
         return False
     return not any(
         detail.get(key) not in (None, "")
         for key in ("num", "stock", "quantity", "min_num", "minOrderQuantity")
     )
+
+
+def _enrich_detail_seller_info(client: Any, detail: dict[str, Any], errors: list[str]) -> None:
+    seller = detail.get("seller_info") if isinstance(detail.get("seller_info"), dict) else {}
+    sid = str(
+        seller.get("sid")
+        or seller.get("seller_id")
+        or seller.get("sellerId")
+        or detail.get("sid")
+        or detail.get("seller_id")
+        or ""
+    ).strip()
+    if not sid or _seller_has_score_and_year(seller):
+        return
+    try:
+        fetched = client.seller_info(sid)
+    except Exception as exc:
+        errors.append(f"seller_info {sid}: {type(exc).__name__}: {str(exc)[:120]}")
+        return
+    if isinstance(fetched, dict) and fetched:
+        detail["seller_info"] = {**seller, **fetched}
+
+
+def _seller_has_score_and_year(seller: dict[str, Any]) -> bool:
+    score = _first_value(seller, "star", "compositeScore", "composite_score", "serviceScore")
+    year = _first_value(seller, "tpyear", "shopYear", "shop_year", "company_time", "years")
+    return bool(score and year)
+
+
+def _has_shop_score_and_year(item: dict[str, Any]) -> bool:
+    if not _shop_text(item):
+        return False
+    return _service_score_value(item) is not None and bool(_shop_year_value(item))
+
+
+def _service_score_value(item: dict[str, Any]) -> float | None:
+    direct = _first_number(item, "compositeScore", "composite_score", "serviceScore")
+    if direct is not None:
+        return direct
+    seller = item.get("seller_info") if isinstance(item.get("seller_info"), dict) else {}
+    seller_alt = item.get("sellerInfo") if isinstance(item.get("sellerInfo"), dict) else {}
+    detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    detail_seller = detail.get("seller_info") if isinstance(detail.get("seller_info"), dict) else {}
+    for source in (seller, seller_alt, detail_seller):
+        value = _first_number(source, "star", "compositeScore", "composite_score", "serviceScore")
+        if value is not None:
+            return value
+    return None
+
+
+def _shop_year_value(item: dict[str, Any]) -> Any:
+    direct = _first_value(item, "shopYear", "shop_year")
+    if direct not in (None, ""):
+        return direct
+    seller = item.get("seller_info") if isinstance(item.get("seller_info"), dict) else {}
+    seller_alt = item.get("sellerInfo") if isinstance(item.get("sellerInfo"), dict) else {}
+    detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    detail_seller = detail.get("seller_info") if isinstance(detail.get("seller_info"), dict) else {}
+    for source in (seller, seller_alt, detail_seller):
+        value = _first_value(source, "tpyear", "shopYear", "shop_year", "company_time", "years")
+        if value not in (None, ""):
+            return value
+    return ""
 
 
 def _merge_confirmed_detail(candidate: dict[str, Any], detail: dict[str, Any]) -> None:
@@ -175,7 +239,11 @@ def _merge_confirmed_detail(candidate: dict[str, Any], detail: dict[str, Any]) -
             candidate[dst_key] = detail[src_key]
     seller = detail.get("seller_info") if isinstance(detail.get("seller_info"), dict) else {}
     if seller:
-        candidate.setdefault("seller_info", seller)
+        existing = candidate.get("seller_info") if isinstance(candidate.get("seller_info"), dict) else {}
+        candidate["seller_info"] = {**existing, **seller}
+    shop = _shop_text({"detail": detail, "seller_info": seller})
+    if shop and not _shop_text(candidate):
+        candidate["shopName"] = shop
 
 
 def _make_data_client():
@@ -239,28 +307,32 @@ def write_csv(result: dict[str, Any], output_path: Path) -> None:
     with output_path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_HEADERS)
         writer.writeheader()
+        row_num = 1
         for idx, item in enumerate(result.get("final") or [], start=1):
             writer.writerow(_csv_row(idx, item))
+            row_num += 1
+        while row_num < 8:
+            writer.writerow({})
+            row_num += 1
+        writer.writerow({CSV_HEADERS[1]: _safe_cell(_b9_summary_text(result))})
 
 
 def _csv_row(rank: int, item: dict[str, Any]) -> dict[str, Any]:
+    del rank
     price = _first_number(item, "unitPrice", "unit_price", "price")
     moq = _first_value(item, "MOQ", "moq", "minOrderQuantity")
-    service = _first_number(item, "compositeScore", "composite_score", "serviceScore")
-    shop_year = _first_value(item, "shopYear", "shop_year")
-    score = _first_number(item, "score")
+    service = _service_score_value(item)
+    shop_year = _shop_year_value(item)
     return {
-        "排名": rank,
         "1688商品标题": _safe_cell(str(item.get("title") or "")),
         "价格(元)": _format_number(price),
+        "邮费": _safe_cell(_shipping_text(item)),
         "起批数": moq or "",
         "规格匹配": _safe_cell(str(item.get("skuMatchLevel") or "")),
         "SKU库存": _safe_cell(_stock_text(item)),
-        "店铺信息": _safe_cell(str(item.get("shopName") or item.get("shop_name") or "")),
+        "店铺信息": _safe_cell(_shop_text(item)),
         "综合服务分": _format_number(service),
         "经营年限": shop_year or "",
-        "得分": _format_number(score),
-        "推荐理由": _safe_cell(_recommendation_text(item)),
         "风险说明": _safe_cell(_risk_text(item)),
         "1688链接": _safe_cell(str(item.get("link") or item.get("detail_url") or "")),
     }
@@ -269,7 +341,7 @@ def _csv_row(rank: int, item: dict[str, Any]) -> dict[str, Any]:
 def _summary_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "title": str(item.get("title") or ""),
-        "shop": str(item.get("shopName") or item.get("shop_name") or ""),
+        "shop": _shop_text(item),
         "unit_price": _format_number(_first_number(item, "unitPrice", "unit_price", "price")),
         "moq": _first_value(item, "MOQ", "moq", "minOrderQuantity") or "",
         "score": _format_number(_first_number(item, "score")),
@@ -277,6 +349,109 @@ def _summary_item(item: dict[str, Any]) -> dict[str, Any]:
         "link": str(item.get("link") or item.get("detail_url") or ""),
         "risk": _risk_text(item),
     }
+
+
+def _b9_summary_text(result: dict[str, Any]) -> str:
+    final = result.get("final") or []
+    if not isinstance(final, list) or not final:
+        return ""
+    first = final[0] if isinstance(final[0], dict) else {}
+    first_link = str(first.get("link") or first.get("detail_url") or "").strip()
+    shops: list[str] = []
+    seen: set[str] = set()
+    for item in final:
+        if not isinstance(item, dict):
+            continue
+        shop = _shop_text(item).strip()
+        if shop and shop not in seen:
+            seen.add(shop)
+            shops.append(shop)
+    return "，".join([part for part in [first_link, *shops] if part])
+
+
+def _shop_text(item: dict[str, Any]) -> str:
+    candidates = [
+        item.get("shopName"),
+        item.get("shop_name"),
+        item.get("storeName"),
+        item.get("sellerName"),
+        item.get("supplierName"),
+        item.get("companyName"),
+        item.get("memberName"),
+    ]
+    seller = item.get("seller_info") if isinstance(item.get("seller_info"), dict) else {}
+    seller_alt = item.get("sellerInfo") if isinstance(item.get("sellerInfo"), dict) else {}
+    detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    detail_seller = detail.get("seller_info") if isinstance(detail.get("seller_info"), dict) else {}
+    for source in (seller, seller_alt, detail_seller):
+        candidates.extend([
+            source.get("title"),
+            source.get("nick"),
+            source.get("shopName"),
+            source.get("shop_name"),
+            source.get("companyName"),
+            source.get("memberName"),
+        ])
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _shipping_text(item: dict[str, Any]) -> str:
+    detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
+    freight = detail.get("freightInfo") if isinstance(detail.get("freightInfo"), dict) else {}
+    free_signals = [
+        item.get("freeShipping"),
+        item.get("free_shipping"),
+        item.get("postFree"),
+        item.get("freeDeliverFee"),
+        item.get("free_deliver_fee"),
+        detail.get("postFree"),
+        detail.get("freeDeliverFee"),
+        detail.get("marketingFreePostage"),
+        freight.get("freeDeliverFee"),
+        freight.get("marketingFreePostage"),
+    ]
+    if any(_truthy_shipping_free(value) for value in free_signals):
+        return "包邮"
+
+    for key in ("shipping", "shipping_fee", "freight", "freight_fee", "delivery_fee"):
+        value = item.get(key)
+        if value not in (None, ""):
+            amount = _first_number({"value": value}, "value")
+            if amount == 0:
+                return "包邮"
+            return _format_number(amount) if amount is not None else str(value)
+
+    for key in ("shipping_fee", "freight", "freight_fee", "delivery_fee"):
+        value = detail.get(key)
+        if value not in (None, ""):
+            amount = _first_number({"value": value}, "value")
+            if amount == 0:
+                return "包邮"
+            return _format_number(amount) if amount is not None else str(value)
+
+    total_cost = _first_number(freight, "totalCost")
+    if total_cost is not None:
+        return "包邮" if total_cost == 0 else _format_number(total_cost)
+
+    first_fee = _first_number(detail, "post_fee", "express_fee", "postFeeValue")
+    if first_fee is None:
+        first_fee = _first_number(item, "post_fee", "express_fee", "postFeeValue")
+    if first_fee is not None:
+        return "包邮" if first_fee == 0 else f"首费{_format_number(first_fee)}"
+    return "待确认"
+
+
+def _truthy_shipping_free(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "包邮", "免邮", "free"}
 
 
 def _stock_text(item: dict[str, Any]) -> str:
@@ -485,7 +660,7 @@ def main() -> int:
     parser.add_argument("--json-output", help="Optional debug JSON path; kept in scratch when run by worker")
     parser.add_argument("--known-brand")
     parser.add_argument("--buy-multiple", type=int)
-    parser.add_argument("--target-count", type=int, default=5)
+    parser.add_argument("--target-count", type=int, default=6)
     args = parser.parse_args()
 
     try:

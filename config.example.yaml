@@ -10,6 +10,13 @@ llm:
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     model: qwen3-vl-max
     api_key: sk-REPLACE_ME
+    # Optional: use Z.ai MCP for visual understanding instead of OpenAI-compatible vision.
+    # provider: zai_mcp
+    # base_url: mcp://zai-mcp-server
+    # model: zai-mcp-server
+    # api_key: sk-REPLACE_ME
+    # mcp_server: zai-mcp-server
+    # mcp_tool: analyze_image
 
   # Model 2: 文本推理。worker 跑 fapiao 等技能时默认走这个 —
   # 纯 tool calling、读 DOM 结果、不需要看图。便宜且快。
@@ -17,6 +24,13 @@ llm:
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     model: qwen3.6-plus
     api_key: sk-REPLACE_ME
+    # Optional OpenAI-compatible vendor knobs:
+    # extra_body:
+    #   thinking:
+    #     type: enabled
+    # reasoning_effort: max
+    # max_tokens: 65536
+    # temperature: 1.0
 
 # 阿里云 DashScope 区域:
 #   - 北京:    https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -65,26 +79,6 @@ ecom_best_source:
     sk: ""
     jwt_expire_seconds: 1800
     http_timeout: 60
-  ai:
-    # APIMart OpenAI-compatible Chat Completions API:
-    #   POST https://api.apimart.ai/v1/chat/completions
-    #   Authorization: Bearer <api_key>
-    #   body: { model: "gpt-5.5", messages: [...] }
-    keyword_extract:
-      base_url: https://api.apimart.ai/v1
-      model: gpt-5.5
-      api_key: ""
-      enabled: false                 # 填真实 api_key 后改 true
-    matcher:
-      base_url: https://api.apimart.ai/v1
-      model: gpt-5.5
-      api_key: ""
-      enabled: false                 # 填真实 api_key 后改 true
-    title_normalize:
-      base_url: https://api.apimart.ai/v1
-      model: gpt-5.5
-      api_key: ""
-      enabled: false                 # 填真实 api_key 后改 true
 
 # 浏览器配置(给 restart_browser intent 用)。
 # - 用你的真实浏览器(已经登录 1688 + 装好扩展那个),restart 走默认 profile
@@ -101,6 +95,18 @@ browsers:
     executable: "/Applications/Google Chrome.app"
     warmup_url: "https://work.1688.com"
   # b1/b4/b5/b6 没配 = 无法用 @bot 重启它们的浏览器(NLU 会回 "浏览器配置缺失")
+
+# Optional MCP servers used by non-browser integrations, e.g. Z.ai visual understanding.
+mcpServers:
+  zai-mcp-server:
+    type: stdio
+    command: npx
+    args:
+      - -y
+      - "@z_ai/mcp-server"
+    env:
+      Z_AI_API_KEY: sk-REPLACE_ME
+      Z_AI_MODE: ZHIPU
 
 # 本机标识 — 所有 bot 共用,卡片标题里显示用,例如 "[pc-jianghu] b2 任务完成"
 machine_name: pc-jianghu

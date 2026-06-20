@@ -381,12 +381,26 @@ async def run(
         base_url=reasoning.base_url,
         api_key=reasoning.api_key,
         model=reasoning.model,
+        provider=reasoning.provider,
+        extra_body=reasoning.extra_body,
+        max_tokens=reasoning.max_tokens,
+        temperature=reasoning.temperature,
+        reasoning_effort=reasoning.reasoning_effort,
+        mcp_server_config=reasoning.mcp_server_config,
+        mcp_tool=reasoning.mcp_tool,
     )
     multimodal_cfg = config.llm_multimodal
     multimodal_llm = LLMClient(
         base_url=multimodal_cfg.base_url,
         api_key=multimodal_cfg.api_key,
         model=multimodal_cfg.model,
+        provider=multimodal_cfg.provider,
+        extra_body=multimodal_cfg.extra_body,
+        max_tokens=multimodal_cfg.max_tokens,
+        temperature=multimodal_cfg.temperature,
+        reasoning_effort=multimodal_cfg.reasoning_effort,
+        mcp_server_config=multimodal_cfg.mcp_server_config,
+        mcp_tool=multimodal_cfg.mcp_tool,
     )
 
     if not requires_browser_mcp:
