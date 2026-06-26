@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent.config import MasterConfig, WorkerConfig
+from agent.mcp_client import resolve_node_bin
 from agent.zombies import _find_pids_on_ports, _get_process_cmdline, _is_oicc_cmdline
 
 
@@ -170,7 +171,7 @@ def _start_worker(config: MasterConfig, wc: WorkerConfig) -> subprocess.Popen:
         log_fh.write(f"\n--- oicc-bridge {wc.worker_id} start port={wc.mcp_port} ---\n".encode("utf-8"))
         log_fh.flush()
         proc = subprocess.Popen(
-            ["node", str(wc.mcp_server_js_path)],
+            [resolve_node_bin("node"), str(wc.mcp_server_js_path)],
             cwd=str(wc.mcp_server_js_path.parent),
             env=env,
             stdin=subprocess.PIPE,

@@ -4,7 +4,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent.config import LLMSettings, MasterConfig, WorkerConfig
-from agent.oicc_bridge import start_daemon, status, stop_daemon, supervisor_pidfile, worker_pidfile
+from agent.mcp_client import resolve_node_bin
+from agent.oicc_bridge import (
+    _start_worker,
+    start_daemon,
+    status,
+    stop_daemon,
+    supervisor_pidfile,
+    worker_pidfile,
+)
 
 
 _DUMMY_LLM = LLMSettings(base_url="http://localhost:9999/v1", model="test", api_key="test")
@@ -71,3 +79,31 @@ def test_stop_daemon_terminates_supervisor_and_worker_pidfiles(tmp_path: Path) -
     assert killed == [999, 111]
     assert not supervisor_pidfile(tmp_path).exists()
     assert not worker_pidfile(tmp_path, "b1").exists()
+
+
+def test_resolve_node_bin_falls_back_to_user_homebrew(tmp_path: Path, monkeypatch) -> None:
+    node = tmp_path / ".homebrew" / "bin" / "node"
+    node.parent.mkdir(parents=True)
+    node.write_text("#!/bin/sh\n", encoding="utf-8")
+    node.chmod(0o755)
+
+    monkeypatch.setattr("agent.mcp_client.shutil.which", lambda _name: None)
+    monkeypatch.setattr("agent.mcp_client.Path.home", lambda: tmp_path)
+
+    assert resolve_node_bin("node") == str(node)
+
+
+def test_start_worker_uses_resolved_node_bin(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    wc = config.workers[0]
+    wc.mcp_server_js_path.parent.mkdir(parents=True)
+    wc.mcp_server_js_path.write_text("// test\n", encoding="utf-8")
+
+    with (
+        patch("agent.oicc_bridge.resolve_node_bin", return_value="/resolved/node"),
+        patch("agent.oicc_bridge.subprocess.Popen") as popen,
+    ):
+        popen.return_value.pid = 123
+        _start_worker(config, wc)
+
+    assert popen.call_args.args[0][:2] == ["/resolved/node", str(wc.mcp_server_js_path)]

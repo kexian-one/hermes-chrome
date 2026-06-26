@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -41,7 +42,7 @@ class OpenClaudeInChromeClient:
     ) -> None:
         self._port = port
         self._script = Path(mcp_server_js_path)
-        self._node = node_bin
+        self._node = resolve_node_bin(node_bin)
         self._extra_env = dict(extra_env or {})
         self._require_bridge = require_bridge
         self._session: ClientSession | None = None
@@ -123,3 +124,21 @@ def _tcp_port_is_listening(port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def resolve_node_bin(node_bin: str = "node") -> str:
+    """Resolve node even under launchd's minimal PATH."""
+    candidate = Path(node_bin).expanduser()
+    if candidate.parent != Path("."):
+        return str(candidate)
+    resolved = shutil.which(node_bin)
+    if resolved:
+        return resolved
+    for path in (
+        Path.home() / ".homebrew/bin" / node_bin,
+        Path("/opt/homebrew/bin") / node_bin,
+        Path("/usr/local/bin") / node_bin,
+    ):
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return node_bin
