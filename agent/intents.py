@@ -4,7 +4,7 @@ import glob
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from agent.cards import (
     code_card,
@@ -37,10 +37,10 @@ class MasterDispatcher(Protocol):
 
     async def restart_worker(self, worker_id: str, reply_to: ReplyTarget | None = None) -> None: ...
     async def spawn_now(
-        self, worker_id: str, skill: str,
+        self, worker_id: str | None, skill: str,
         reply_to: ReplyTarget | None = None,
         task: str = "",
-    ) -> None: ...
+    ) -> Any: ...
     async def spawn_freeform(self, worker_id: str, task: str, reply_to: ReplyTarget | None = None) -> None: ...
     async def restart_browser_for(self, worker_id: str, reply_to: ReplyTarget | None = None) -> dict: ...
     async def restart_self(self, reply_to: ReplyTarget | None = None) -> dict: ...
@@ -270,16 +270,93 @@ async def _run_now(
     worker_id = args.get("worker_id", "")
     skill = args.get("skill", "")
     task = str(args.get("task", "") or "").strip()
-    if not _WORKER_RE.match(worker_id):
+    worker_explicit = bool(args.get("worker_explicit", bool(worker_id)))
+    dispatch_worker_id = worker_id if worker_explicit else None
+    if dispatch_worker_id and not _WORKER_RE.match(dispatch_worker_id):
         return error_card(f"[{machine_name}] 参数错误", "worker_id 需要 b1-b6")
     if not _SKILL_RE.match(skill):
         return error_card(f"[{machine_name}] 参数错误", "skill 名不对,例如 `fapiao-1688`")
-    await master.spawn_now(worker_id, skill, reply_to, task=task)
+    result = await master.spawn_now(dispatch_worker_id, skill, reply_to, task=task)
+    card = _run_now_result_card(result, worker_id if worker_explicit else "", skill, task, machine_name)
+    if card is not None:
+        return card
     task_hint = f" · 输入: {task[:60]}{'...' if len(task) > 60 else ''}" if task else ""
     return success_card(
         f"[{machine_name}] 已派发",
-        f"`{worker_id}` 正在跑 `{skill}`{task_hint}",
+        f"`{worker_id if worker_explicit else '自动分配'}` 正在跑 `{skill}`{task_hint}",
     )
+
+
+def _run_now_result_card(
+    result: Any,
+    requested_worker_id: str,
+    requested_skill: str,
+    task: str,
+    machine_name: str,
+) -> dict | None:
+    def _value(name: str, fallback: str = "") -> Any:
+        if isinstance(result, dict):
+            return result.get(name, fallback)
+        return getattr(result, name, fallback)
+
+    status = str(
+        _value("status")
+        or (result.get("state") if isinstance(result, dict) else "")
+        or ""
+    ).lower()
+    if not status:
+        return None
+
+    worker_id = str(
+        _value("worker_id")
+        or (result.get("worker") if isinstance(result, dict) else "")
+        or requested_worker_id
+        or "自动分配"
+    )
+    skill = str(_value("skill") or requested_skill)
+    task_hint = f" · 输入: {task[:60]}{'...' if len(task) > 60 else ''}" if task else ""
+
+    if status in {"started", "dispatched"}:
+        return success_card(
+            f"[{machine_name}] 已派发",
+            f"`{worker_id}` 正在跑 `{skill}`{task_hint}",
+        )
+
+    if status == "queued":
+        position = (
+            result.get("position", result.get("queue_position"))
+            if isinstance(result, dict)
+            else _value("queue_position")
+        )
+        queue = (
+            result.get("queue", result.get("queue_name", result.get("queue_id", "")))
+            if isinstance(result, dict)
+            else _value("queue")
+        )
+        target_text = f"`{worker_id}` 的" if worker_id != "自动分配" else "自动分配 worker 的"
+        lines = [f"{target_text} `{skill}` 已排队{task_hint}"]
+        if position not in (None, ""):
+            lines.append(f"- 排队位置: `{position}`")
+        if queue not in (None, ""):
+            if isinstance(queue, (list, tuple)):
+                queue_text = ", ".join(f"`{item}`" for item in queue)
+            else:
+                queue_text = f"`{queue}`"
+            lines.append(f"- 队列: {queue_text}")
+        return info_card(f"[{machine_name}] 已排队", "\n".join(lines))
+
+    if status == "rejected":
+        reason = str(
+            _value("reason")
+            or (result.get("message") if isinstance(result, dict) else "")
+            or "未提供原因"
+        )
+        return error_card(
+            f"[{machine_name}] 派发被拒绝",
+            f"`{worker_id}` 未启动 `{skill}`: {reason}",
+        )
+
+    return None
 
 
 def _schedule_add(

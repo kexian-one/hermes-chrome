@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -190,6 +191,84 @@ async def test_run_now_dispatches(tmp_path: Path):
     )
     d.spawn_now.assert_called_once_with("b2", "fapiao-1688", None, task="")
     assert "b2" in _all_text(reply) and "fapiao-1688" in _all_text(reply)
+
+
+@pytest.mark.asyncio
+async def test_run_now_started_card_uses_actual_worker(tmp_path: Path):
+    d = _make_dispatcher(tmp_path)
+    d.spawn_now.return_value = SimpleNamespace(
+        status="dispatched",
+        worker_id="b4",
+        skill="ecom-best-source",
+    )
+    reply = await handle(
+        IntentDispatch(Intent.RUN_NOW, {"worker_id": "b1", "skill": "ecom-best-source"}),
+        d, MACHINE,
+    )
+    text = _all_text(reply)
+    assert "b4" in text
+    assert "b1" not in text
+    assert "ecom-best-source" in text
+
+
+@pytest.mark.asyncio
+async def test_run_now_unexplicit_worker_uses_auto_dispatch(tmp_path: Path):
+    d = _make_dispatcher(tmp_path)
+    d.spawn_now.return_value = SimpleNamespace(
+        status="dispatched",
+        worker_id="b3",
+        skill="ecom-best-source",
+    )
+    reply = await handle(
+        IntentDispatch(Intent.RUN_NOW, {
+            "worker_id": "b1",
+            "worker_explicit": False,
+            "skill": "ecom-best-source",
+        }),
+        d, MACHINE,
+    )
+    d.spawn_now.assert_called_once_with(None, "ecom-best-source", None, task="")
+    text = _all_text(reply)
+    assert "b3" in text
+    assert "b1" not in text
+
+
+@pytest.mark.asyncio
+async def test_run_now_queued_card_shows_position_and_queue(tmp_path: Path):
+    d = _make_dispatcher(tmp_path)
+    d.spawn_now.return_value = {
+        "status": "queued",
+        "worker_id": "b1",
+        "skill": "ecom-best-source",
+        "position": 2,
+        "queue": ["b3", "b1"],
+    }
+    reply = await handle(
+        IntentDispatch(Intent.RUN_NOW, {"worker_id": "b1", "skill": "ecom-best-source"}),
+        d, MACHINE,
+    )
+    text = _all_text(reply)
+    assert "已排队" in text
+    assert "排队位置" in text and "2" in text
+    assert "队列" in text and "b3" in text and "b1" in text
+
+
+@pytest.mark.asyncio
+async def test_run_now_rejected_card_shows_reason(tmp_path: Path):
+    d = _make_dispatcher(tmp_path)
+    d.spawn_now.return_value = {
+        "status": "rejected",
+        "worker_id": "b2",
+        "skill": "ecom-best-source",
+        "reason": "没有可用 worker",
+    }
+    reply = await handle(
+        IntentDispatch(Intent.RUN_NOW, {"worker_id": "b2", "skill": "ecom-best-source"}),
+        d, MACHINE,
+    )
+    text = _all_text(reply)
+    assert "派发被拒绝" in text
+    assert "没有可用 worker" in text
 
 
 @pytest.mark.asyncio

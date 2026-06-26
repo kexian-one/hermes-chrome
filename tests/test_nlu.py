@@ -34,7 +34,7 @@ async def test_route_restart_worker():
     llm = _mock_llm({"intent": "restart_worker", "args": {"worker_id": "b3"}})
     result = await route("重启 b3", llm)
     assert result.intent == Intent.RESTART_WORKER
-    assert result.args == {"worker_id": "b3"}
+    assert result.args == {"worker_id": "b3", "worker_explicit": True}
 
 
 @pytest.mark.asyncio
@@ -114,7 +114,31 @@ async def test_route_run_now():
     llm = _mock_llm({"intent": "run_now", "args": {"worker_id": "b2", "skill": "fapiao-1688"}})
     result = await route("b2 现在跑 fapiao-1688", llm)
     assert result.intent == Intent.RUN_NOW
-    assert result.args == {"worker_id": "b2", "skill": "fapiao-1688"}
+    assert result.args == {"worker_id": "b2", "skill": "fapiao-1688", "worker_explicit": True}
+
+
+@pytest.mark.asyncio
+async def test_route_run_now_marks_worker_not_explicit_when_defaulted():
+    llm = _mock_llm({
+        "intent": "run_now",
+        "args": {"worker_id": "b1", "skill": "ecom-best-source", "task": "找货 https://item.jd.com/12345.html"},
+    })
+    result = await route("找货 https://item.jd.com/12345.html", llm)
+    assert result.intent == Intent.RUN_NOW
+    assert result.args["worker_id"] == "b1"
+    assert result.args["worker_explicit"] is False
+
+
+@pytest.mark.asyncio
+async def test_route_run_now_marks_explicit_b1():
+    llm = _mock_llm({
+        "intent": "run_now",
+        "args": {"worker_id": "b1", "skill": "ecom-best-source", "task": "找货 https://item.jd.com/12345.html"},
+    })
+    result = await route("b1 找货 https://item.jd.com/12345.html", llm)
+    assert result.intent == Intent.RUN_NOW
+    assert result.args["worker_id"] == "b1"
+    assert result.args["worker_explicit"] is True
 
 
 @pytest.mark.asyncio
@@ -129,6 +153,7 @@ async def test_route_ecom_preserves_jd_url_when_llm_summarizes_task():
     )
     assert result.intent == Intent.RUN_NOW
     assert result.args["task"] == "要3 https://item.jd.com/10159624742014.html"
+    assert result.args["worker_explicit"] is False
 
 
 @pytest.mark.asyncio
@@ -146,6 +171,7 @@ async def test_route_ecom_does_not_duplicate_existing_task_url():
         llm,
     )
     assert result.args["task"] == "要3 https://item.jd.com/10159624742014.html"
+    assert result.args["worker_explicit"] is False
 
 
 @pytest.mark.asyncio
@@ -156,6 +182,21 @@ async def test_route_ecom_recovers_unknown_when_message_contains_jd_url():
     assert result.intent == Intent.RUN_NOW
     assert result.args == {
         "worker_id": "b1",
+        "worker_explicit": False,
+        "skill": "ecom-best-source",
+        "task": text,
+    }
+
+
+@pytest.mark.asyncio
+async def test_route_ecom_recovers_jd_url_without_explicit_worker():
+    llm = _mock_llm({"intent": "unknown", "args": {}})
+    text = "找货 https://item.jd.com/10159624742014.html 要3"
+    result = await route(text, llm)
+    assert result.intent == Intent.RUN_NOW
+    assert result.args == {
+        "worker_id": "b1",
+        "worker_explicit": False,
         "skill": "ecom-best-source",
         "task": text,
     }
@@ -183,6 +224,7 @@ async def test_route_ecom_recovers_freeform_when_message_contains_jd_url():
     assert result.intent == Intent.RUN_NOW
     assert result.args == {
         "worker_id": "b1",
+        "worker_explicit": False,
         "skill": "ecom-best-source",
         "task": text,
     }
@@ -197,6 +239,7 @@ async def test_route_ecom_recovery_keeps_worker_from_freeform_args():
     result = await route("https://item.jd.com/10159624742014.html 要3", llm)
     assert result.intent == Intent.RUN_NOW
     assert result.args["worker_id"] == "b3"
+    assert result.args["worker_explicit"] is False
 
 
 @pytest.mark.asyncio
@@ -237,7 +280,7 @@ async def test_route_freeform():
     llm = _mock_llm({"intent": "freeform", "args": {"worker_id": "b2", "task": "去京东刷购物车"}})
     result = await route("b2 去京东刷购物车", llm)
     assert result.intent == Intent.FREEFORM
-    assert result.args == {"worker_id": "b2", "task": "去京东刷购物车"}
+    assert result.args == {"worker_id": "b2", "task": "去京东刷购物车", "worker_explicit": True}
 
 
 @pytest.mark.asyncio

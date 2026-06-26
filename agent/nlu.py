@@ -50,7 +50,7 @@ Intents:
 - query_stats: User wants today's statistics. Examples: "今天的统计", "今天开了多少"
 - pause_all: User wants to pause all workers. Examples: "暂停所有", "停一下"
 - resume_all: User wants to resume. Examples: "继续", "恢复"
-- run_now: User wants to spawn a skill on a specific worker IMMEDIATELY (not on a schedule). Args: {"worker_id": "bN", "skill": "<skill-name>", "task": "<optional runtime input>"}. Map the user's natural language to one of the skills listed under "Available skills" below. If no skill matches, classify as unknown (do NOT invent a skill name).
+- run_now: User wants to spawn a skill on a specific worker IMMEDIATELY (not on a schedule). Args: {"worker_id": "bN", "worker_explicit": true/false, "skill": "<skill-name>", "task": "<optional runtime input>"}. `worker_explicit` is true only when the CURRENT user message explicitly names a worker (e.g. b1, worker 1, 账号1, 工号1); false when a worker is inferred/defaulted/recovered from context. Do NOT treat the bot mention/name like "开票助手1号" as a worker choice. Map the user's natural language to one of the skills listed under "Available skills" below. If no skill matches, classify as unknown (do NOT invent a skill name).
     **task field**: When the user provides runtime input the skill needs (a URL, a SKU name, a filename, a topic), put that input — VERBATIM, in Chinese — into `task`. URLs go in `task` whole. If user gives no runtime input, omit `task` or set it to "". Examples below.
     Examples:
     "b1 现在跑 ecom-best-source https://item.jd.com/12345.html" → {"worker_id": "b1", "skill": "ecom-best-source", "task": "https://item.jd.com/12345.html"}
@@ -74,7 +74,7 @@ Intents:
 - schedule_list: User wants to see all scheduled tasks. Examples: "看定时任务", "现在有哪些定时", "查 schedule", "定时任务列表"
 - skill_list: User wants to see what SKILLS (capabilities) the bot currently has installed (not scheduled tasks). Examples: "你都能干啥", "有哪些 skill", "有什么技能", "看 skill 列表", "skills"
 - schedule_remove: User wants to remove a scheduled task. Args: {"entry_id": <int>}. Examples: "删掉 #3" → {"entry_id": 3}, "删除定时 5" → {"entry_id": 5}
-- freeform: FALLBACK — the user describes a concrete browser task on a worker, but NO existing skill matches it. The worker will receive the user's text verbatim and try to complete it using its MCP browser tools (navigate, click, read DOM, exec JS) without any pre-written skill body. Args: {"worker_id": "bN", "task": "<user's task verbatim, in Chinese>"}. ALWAYS prefer run_now / schedule_add with a matching skill if any matches. Only use freeform when you are sure no skill covers it. Examples:
+- freeform: FALLBACK — the user describes a concrete browser task on a worker, but NO existing skill matches it. The worker will receive the user's text verbatim and try to complete it using its MCP browser tools (navigate, click, read DOM, exec JS) without any pre-written skill body. Args: {"worker_id": "bN", "worker_explicit": true/false, "task": "<user's task verbatim, in Chinese>"}. ALWAYS prefer run_now / schedule_add with a matching skill if any matches. Only use freeform when you are sure no skill covers it. Examples:
     "b2 去京东帮我刷下购物车" → {"worker_id": "b2", "task": "去京东帮我刷下购物车"}
     "让 b3 在 1688 看下最近商家给我的留言" → {"worker_id": "b3", "task": "在 1688 看下最近商家给我的留言"}
 - help: User asks for help. Examples: "你能做什么", "/help", "怎么用"
@@ -150,6 +150,16 @@ _ECOM_URL_RE = re.compile(
     re.IGNORECASE,
 )
 _WORKER_ID_RE = re.compile(r"\bb([1-6])\b", re.IGNORECASE)
+_EXPLICIT_WORKER_PATTERNS = (
+    _WORKER_ID_RE,
+    re.compile(r"\bworker\s*#?\s*([1-6])\b", re.IGNORECASE),
+    re.compile(r"(?:账号|工号|槽位)\s*([1-6])\s*号?"),
+)
+_WORKER_INTENTS = {
+    Intent.RUN_NOW,
+    Intent.SCHEDULE_ADD,
+    Intent.FREEFORM,
+}
 
 
 def _format_recent_context(recent_turns: list[tuple[str, str, str]]) -> str:
@@ -197,6 +207,7 @@ async def route(
         dispatch = IntentDispatch(intent=intent, args=args)
         _recover_ecom_dispatch(dispatch, text)
         _recover_ecom_task_url(dispatch, text)
+        _mark_worker_explicit(dispatch, text)
         return dispatch
     except Exception as exc:
         logger.warning("NLU route failed (returning unknown): %s: %s", type(exc).__name__, exc)
@@ -238,8 +249,8 @@ def _recover_ecom_dispatch(dispatch: IntentDispatch, source_text: str) -> None:
         return
     if not _ECOM_URL_RE.search(source_text):
         return
-    worker_match = _WORKER_ID_RE.search(source_text)
-    worker_id = f"b{worker_match.group(1)}" if worker_match else str(dispatch.args.get("worker_id") or "b1")
+    explicit_worker_id = _explicit_worker_id(source_text)
+    worker_id = explicit_worker_id or str(dispatch.args.get("worker_id") or "b1")
     if not _WORKER_ID_RE.fullmatch(worker_id):
         worker_id = "b1"
     dispatch.intent = Intent.RUN_NOW
@@ -248,3 +259,21 @@ def _recover_ecom_dispatch(dispatch: IntentDispatch, source_text: str) -> None:
         "skill": "ecom-best-source",
         "task": source_text.strip(),
     }
+
+
+def _explicit_worker_id(source_text: str) -> str | None:
+    for pattern in _EXPLICIT_WORKER_PATTERNS:
+        match = pattern.search(source_text)
+        if match:
+            return f"b{match.group(1)}".lower()
+    return None
+
+
+def _mark_worker_explicit(dispatch: IntentDispatch, source_text: str) -> None:
+    if "worker_id" not in dispatch.args and dispatch.intent not in _WORKER_INTENTS:
+        return
+    explicit_worker_id = _explicit_worker_id(source_text)
+    worker_id = str(dispatch.args.get("worker_id") or "").lower()
+    if worker_id:
+        dispatch.args["worker_id"] = worker_id
+    dispatch.args["worker_explicit"] = bool(explicit_worker_id and explicit_worker_id == worker_id)

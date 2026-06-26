@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import os
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from agent.channels import ReplyTarget
 from agent.config import LLMSettings, MasterConfig, WorkerConfig
 from agent.master import (
+    _MasterDispatcherImpl,
     _collect_outputs,
     fire_due_entries,
     run_once,
@@ -92,6 +95,204 @@ async def test_spawn_one_skill_updates_tracker(tmp_path: Path):
     assert snapshot[0].worker_id == "b3"
     assert snapshot[0].last_skill == "fapiao-1688"
     assert snapshot[0].last_exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_now_auto_selects_idle_worker(tmp_path: Path):
+    config = _make_config(tmp_path)
+    tracker = WorkerStateTracker()
+    tracker.update_spawn("b1", "busy", 111)
+    dispatcher = _MasterDispatcherImpl(
+        config, tracker, ScheduleStore(tmp_path / "schedule.yaml"), [False],
+    )
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_spawn(wc, skill, log_path, **kwargs):
+        calls.append((wc.worker_id, skill, kwargs.get("task", "")))
+        tracker.update_exit(wc.worker_id, 0)
+        return 0
+
+    with patch("agent.master.spawn_one_skill", side_effect=fake_spawn):
+        result = await dispatcher.spawn_now(None, "ecom-best-source", task="url")
+        await asyncio.sleep(0)
+
+    assert result.status == "started"
+    assert result.worker_id == "b2"
+    assert result.explicit_worker is False
+    assert calls == [("b2", "ecom-best-source", "url")]
+
+
+@pytest.mark.asyncio
+async def test_spawn_now_explicit_busy_queues_worker_only(tmp_path: Path):
+    config = _make_config(tmp_path)
+    tracker = WorkerStateTracker()
+    dispatcher = _MasterDispatcherImpl(
+        config, tracker, ScheduleStore(tmp_path / "schedule.yaml"), [False],
+    )
+    release = asyncio.Event()
+    calls: list[tuple[str, str]] = []
+
+    async def fake_spawn(wc, skill, log_path, **kwargs):
+        calls.append((wc.worker_id, skill))
+        if len(calls) == 1:
+            await release.wait()
+        tracker.update_exit(wc.worker_id, 0)
+        return 0
+
+    with patch("agent.master.spawn_one_skill", side_effect=fake_spawn):
+        first = await dispatcher.spawn_now("b1", "skill-one")
+        second = await dispatcher.spawn_now("b1", "skill-two")
+        await asyncio.sleep(0)
+        assert first.status == "started"
+        assert second.status == "queued"
+        assert second.queue == "b1"
+        assert second.worker_id == "b1"
+        assert calls == [("b1", "skill-one")]
+        release.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(calls) == 2:
+                break
+
+    assert calls == [("b1", "skill-one"), ("b1", "skill-two")]
+
+
+@pytest.mark.asyncio
+async def test_spawn_now_auto_all_busy_queues_global_and_drains(tmp_path: Path):
+    config = _make_config(tmp_path)
+    tracker = WorkerStateTracker()
+    for i in range(1, 7):
+        tracker.update_spawn(f"b{i}", "busy", 100 + i)
+    dispatcher = _MasterDispatcherImpl(
+        config, tracker, ScheduleStore(tmp_path / "schedule.yaml"), [False],
+    )
+    calls: list[tuple[str, str]] = []
+
+    async def fake_spawn(wc, skill, log_path, **kwargs):
+        calls.append((wc.worker_id, skill))
+        tracker.update_exit(wc.worker_id, 0)
+        return 0
+
+    with patch("agent.master.spawn_one_skill", side_effect=fake_spawn):
+        result = await dispatcher.spawn_now(None, "queued-skill")
+        assert result.status == "queued"
+        assert result.queue == "global"
+        assert result.worker_id is None
+        tracker.update_exit("b3", 0)
+        await dispatcher._drain_queues("b3")
+        await asyncio.sleep(0)
+
+    assert calls == [("b3", "queued-skill")]
+
+
+@pytest.mark.asyncio
+async def test_queued_auto_tasks_keep_each_origin_chat_when_drained(tmp_path: Path):
+    config = _make_config(tmp_path)
+    tracker = WorkerStateTracker()
+    for i in range(1, 7):
+        tracker.update_spawn(f"b{i}", "busy", 100 + i)
+    dispatcher = _MasterDispatcherImpl(
+        config, tracker, ScheduleStore(tmp_path / "schedule.yaml"), [False],
+    )
+    sent: list[tuple[str, dict]] = []
+    spawned: list[tuple[str, str, str]] = []
+
+    class FakeChannel:
+        async def send(self, target_id, payload):
+            sent.append((target_id, payload))
+
+    channel = FakeChannel()
+    group_a = ReplyTarget(channel=channel, target_id="oc_group_a", supports_files=False)
+    group_b = ReplyTarget(channel=channel, target_id="oc_group_b", supports_files=False)
+
+    async def fake_spawn(wc, skill, log_path, **kwargs):
+        reply_to = kwargs.get("reply_to")
+        spawned.append((wc.worker_id, skill, reply_to.target_id if reply_to else ""))
+        tracker.update_exit(wc.worker_id, 0)
+        return 0
+
+    with patch("agent.master.spawn_one_skill", side_effect=fake_spawn):
+        first = await dispatcher.spawn_now(None, "skill-a", group_a, task="from A")
+        second = await dispatcher.spawn_now(None, "skill-b", group_b, task="from B")
+        assert first.status == "queued"
+        assert second.status == "queued"
+
+        tracker.update_exit("b2", 0)
+        tracker.update_exit("b5", 0)
+        await dispatcher._drain_queues("b2")
+        for _ in range(30):
+            await asyncio.sleep(0)
+            if len(spawned) == 2 and len(sent) == 2:
+                break
+
+    assert spawned == [
+        ("b2", "skill-a", "oc_group_a"),
+        ("b5", "skill-b", "oc_group_b"),
+    ]
+    assert [target_id for target_id, _payload in sent] == ["oc_group_a", "oc_group_b"]
+    assert all("队列任务开始" in payload["card"]["header"]["title"]["content"] for _, payload in sent)
+
+
+@pytest.mark.asyncio
+async def test_spawn_now_auto_preserves_existing_global_queue_fifo(tmp_path: Path):
+    config = _make_config(tmp_path)
+    tracker = WorkerStateTracker()
+    dispatcher = _MasterDispatcherImpl(
+        config, tracker, ScheduleStore(tmp_path / "schedule.yaml"), [False],
+    )
+    dispatcher._queue_global("old-skill", None, "old")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_spawn(wc, skill, log_path, **kwargs):
+        calls.append((wc.worker_id, skill, kwargs.get("task", "")))
+        tracker.update_exit(wc.worker_id, 0)
+        return 0
+
+    with patch("agent.master.spawn_one_skill", side_effect=fake_spawn):
+        result = await dispatcher.spawn_now(None, "new-skill", task="new")
+        assert result.status == "queued"
+        assert result.queue == "global"
+        assert result.queue_position == 2
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if len(calls) == 2:
+                break
+
+    assert calls == [
+        ("b1", "old-skill", "old"),
+        ("b2", "new-skill", "new"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_spawn_now_explicit_preserves_existing_worker_queue_fifo(tmp_path: Path):
+    config = _make_config(tmp_path)
+    tracker = WorkerStateTracker()
+    dispatcher = _MasterDispatcherImpl(
+        config, tracker, ScheduleStore(tmp_path / "schedule.yaml"), [False],
+    )
+    dispatcher._queue_for_worker("b1", "old-skill", None, "old")
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_spawn(wc, skill, log_path, **kwargs):
+        calls.append((wc.worker_id, skill, kwargs.get("task", "")))
+        tracker.update_exit(wc.worker_id, 0)
+        return 0
+
+    with patch("agent.master.spawn_one_skill", side_effect=fake_spawn):
+        result = await dispatcher.spawn_now("b1", "new-skill", task="new")
+        assert result.status == "queued"
+        assert result.queue == "b1"
+        assert result.queue_position == 2
+        for _ in range(30):
+            await asyncio.sleep(0)
+            if len(calls) == 2:
+                break
+
+    assert calls == [
+        ("b1", "old-skill", "old"),
+        ("b1", "new-skill", "new"),
+    ]
 
 
 @pytest.mark.asyncio

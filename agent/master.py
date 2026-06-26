@@ -8,6 +8,8 @@ import logging
 import os
 import re
 import sys
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
 # Force UTF-8 on stdout/stderr — Windows default is GBK and crashes on Unicode
@@ -65,6 +67,31 @@ from agent.worker_state import WorkerStateTracker
 
 SCHEDULE_STATE_PATH = Path("state/schedule.yaml")
 CRON_POLL_INTERVAL_SECS = 60
+AUTO_WORKER_IDS = tuple(f"b{i}" for i in range(1, 7))
+
+
+@dataclass(frozen=True)
+class DispatchResult:
+    status: str
+    worker_id: str | None
+    skill: str
+    task: str = ""
+    queue: str = ""
+    queue_position: int = 0
+    reason: str = ""
+    explicit_worker: bool = False
+
+
+@dataclass
+class _QueuedDispatch:
+    skill: str
+    task: str = ""
+    reply_to: ReplyTarget | None = None
+    requested_worker_id: str | None = None
+    explicit_worker: bool = False
+    created_at: datetime = field(
+        default_factory=lambda: datetime.now(tz=timezone.utc)
+    )
 
 
 class _MasterDispatcherImpl:
@@ -101,6 +128,11 @@ class _MasterDispatcherImpl:
         # synchronously alongside `_is_alive` to close the window where
         # `asyncio.create_task` returns but the tracker hasn't been updated yet.
         self._pending: set[str] = set()
+        self._global_queue: deque[_QueuedDispatch] = deque()
+        self._worker_queues: dict[str, deque[_QueuedDispatch]] = {
+            worker_id: deque() for worker_id in AUTO_WORKER_IDS
+        }
+        self._drain_lock = asyncio.Lock()
         # Same idea for browser restart — without this, an impatient user
         # spamming `[b2] 重启浏览器` runs the 30s kill+relaunch cycle in
         # parallel for the SAME worker, killing each other's freshly-spawned
@@ -195,6 +227,207 @@ class _MasterDispatcherImpl:
     def _release_worker(self, worker_id: str) -> None:
         self._pending.discard(worker_id)
 
+    def _is_worker_idle(self, worker_id: str) -> bool:
+        return (
+            worker_id not in self._unhealthy
+            and worker_id not in self._pending
+            and not self._is_alive(worker_id)
+            and self._worker_config(worker_id) is not None
+        )
+
+    def _idle_auto_workers(self) -> list[str]:
+        return [
+            worker_id for worker_id in AUTO_WORKER_IDS
+            if self._is_worker_idle(worker_id)
+        ]
+
+    def _worker_queue(self, worker_id: str) -> deque[_QueuedDispatch]:
+        if worker_id not in self._worker_queues:
+            self._worker_queues[worker_id] = deque()
+        return self._worker_queues[worker_id]
+
+    def _queue_for_worker(
+        self,
+        worker_id: str,
+        skill: str,
+        reply_to: ReplyTarget | None,
+        task: str,
+    ) -> DispatchResult:
+        queue = self._worker_queue(worker_id)
+        queue.append(_QueuedDispatch(
+            skill=skill,
+            task=task,
+            reply_to=reply_to,
+            requested_worker_id=worker_id,
+            explicit_worker=True,
+        ))
+        return DispatchResult(
+            status="queued",
+            worker_id=worker_id,
+            skill=skill,
+            task=task,
+            queue=worker_id,
+            queue_position=len(queue),
+            reason="worker_busy",
+            explicit_worker=True,
+        )
+
+    def _queue_global(
+        self,
+        skill: str,
+        reply_to: ReplyTarget | None,
+        task: str,
+    ) -> DispatchResult:
+        self._global_queue.append(_QueuedDispatch(
+            skill=skill,
+            task=task,
+            reply_to=reply_to,
+            requested_worker_id=None,
+            explicit_worker=False,
+        ))
+        return DispatchResult(
+            status="queued",
+            worker_id=None,
+            skill=skill,
+            task=task,
+            queue="global",
+            queue_position=len(self._global_queue),
+            reason="all_workers_busy",
+            explicit_worker=False,
+        )
+
+    def _start_spawn(
+        self,
+        worker_id: str,
+        skill: str,
+        reply_to: ReplyTarget | None,
+        task: str = "",
+        explicit_worker: bool = True,
+        queued: bool = False,
+    ) -> DispatchResult:
+        wc = self._worker_config(worker_id)
+        if wc is None:
+            return DispatchResult(
+                status="rejected",
+                worker_id=worker_id,
+                skill=skill,
+                task=task,
+                reason="unknown_worker",
+                explicit_worker=explicit_worker,
+            )
+        if worker_id in self._unhealthy:
+            print(f"[health] {worker_id} is unhealthy, skipping spawn_now")
+            return DispatchResult(
+                status="rejected",
+                worker_id=worker_id,
+                skill=skill,
+                task=task,
+                reason="worker_unhealthy",
+                explicit_worker=explicit_worker,
+            )
+        if not self._reserve_worker(worker_id, skill):
+            return DispatchResult(
+                status="rejected",
+                worker_id=worker_id,
+                skill=skill,
+                task=task,
+                reason="worker_busy",
+                explicit_worker=explicit_worker,
+            )
+        ts = _timestamp()
+        log_path = self.log_dir / f"worker-{worker_id}-{ts}.log"
+        resolved_reply = self._resolve_reply_to(reply_to)
+        spawn_task = asyncio.create_task(
+            spawn_one_skill(
+                wc, skill, log_path, tracker=self.worker_state,
+                reply_to=resolved_reply,
+                machine_name=self._machine_name_for(resolved_reply),
+                project_root=self._config.project_root,
+                task=task,
+            )
+        )
+        self._inflight.add(spawn_task)
+        spawn_task.add_done_callback(
+            lambda t, wid=worker_id, rt=resolved_reply: self._on_spawn_done(t, wid, rt)
+        )
+        if queued and resolved_reply and resolved_reply.is_valid:
+            from agent.cards import success_card
+            task_hint = (
+                f" · 输入: {task[:60]}{'...' if len(task) > 60 else ''}"
+                if task
+                else ""
+            )
+            asyncio.create_task(resolved_reply.send_card(success_card(
+                f"[{self._machine_name_for(resolved_reply)}] 队列任务开始",
+                f"`{worker_id}` 正在跑 `{skill}`{task_hint}",
+            )))
+        return DispatchResult(
+            status="started",
+            worker_id=worker_id,
+            skill=skill,
+            task=task,
+            explicit_worker=explicit_worker,
+        )
+
+    def _schedule_drain(self, preferred_worker_id: str | None = None) -> None:
+        asyncio.create_task(self._drain_queues(preferred_worker_id))
+
+    async def _drain_queues(self, preferred_worker_id: str | None = None) -> None:
+        async with self._drain_lock:
+            if preferred_worker_id:
+                queue = self._worker_queue(preferred_worker_id)
+                if queue and self._is_worker_idle(preferred_worker_id):
+                    item = queue.popleft()
+                    result = self._start_spawn(
+                        preferred_worker_id,
+                        item.skill,
+                        item.reply_to,
+                        task=item.task,
+                        explicit_worker=True,
+                        queued=True,
+                    )
+                    if result.status != "started":
+                        queue.appendleft(item)
+
+            # A worker-specific queue can only run on that worker. Drain these
+            # before the global queue so a named worker request does not get
+            # delayed by later "any worker" tasks.
+            for worker_id in AUTO_WORKER_IDS:
+                if worker_id == preferred_worker_id:
+                    continue
+                queue = self._worker_queue(worker_id)
+                if not queue or not self._is_worker_idle(worker_id):
+                    continue
+                item = queue.popleft()
+                result = self._start_spawn(
+                    worker_id,
+                    item.skill,
+                    item.reply_to,
+                    task=item.task,
+                    explicit_worker=True,
+                    queued=True,
+                )
+                if result.status != "started":
+                    queue.appendleft(item)
+
+            while self._global_queue:
+                idle_workers = self._idle_auto_workers()
+                if not idle_workers:
+                    break
+                worker_id = idle_workers[0]
+                item = self._global_queue.popleft()
+                result = self._start_spawn(
+                    worker_id,
+                    item.skill,
+                    item.reply_to,
+                    task=item.task,
+                    explicit_worker=False,
+                    queued=True,
+                )
+                if result.status != "started":
+                    self._global_queue.appendleft(item)
+                    break
+
     def _on_spawn_done(
         self, task: asyncio.Task, worker_id: str, reply_to: ReplyTarget | None,
     ) -> None:
@@ -209,6 +442,7 @@ class _MasterDispatcherImpl:
         self._inflight.discard(task)
         self._release_worker(worker_id)
         if task.cancelled():
+            self._schedule_drain(worker_id)
             return
         exc = task.exception()
         if exc is not None:
@@ -222,17 +456,25 @@ class _MasterDispatcherImpl:
                     f"`{type(exc).__name__}`: {str(exc)[:300]}",
                 )
                 asyncio.create_task(reply_to.send_card(card))
+            self._schedule_drain(worker_id)
             return
 
         try:
             exit_code = task.result()
         except Exception:
+            self._schedule_drain(worker_id)
             return
         if exit_code == 2 and worker_id in self._config.browsers:
             # mcp-failed + we know how to restart this worker's browser →
             # auto-recover. Schedule, don't await, since we're in a sync
             # callback context.
-            asyncio.create_task(self._auto_recover_browser(worker_id, reply_to))
+            async def _recover_then_drain() -> None:
+                await self._auto_recover_browser(worker_id, reply_to)
+                await self._drain_queues(worker_id)
+
+            asyncio.create_task(_recover_then_drain())
+            return
+        self._schedule_drain(worker_id)
 
     async def _auto_recover_browser(self, worker_id: str, reply_to: ReplyTarget | None) -> None:
         """Triggered when a worker exits mcp-failed: kill + relaunch the
@@ -320,39 +562,77 @@ class _MasterDispatcherImpl:
         )
 
     async def spawn_now(
-        self, worker_id: str, skill: str,
+        self, worker_id: str | None, skill: str,
         reply_to: ReplyTarget | None = None,
         task: str = "",
-    ) -> None:
+    ) -> DispatchResult:
         """`task`: optional free-form parameter forwarded to the skill as
         the worker's first user message. Used when a skill needs runtime
         input — e.g. ecom-best-source needs the JD product URL the user
         @-mentioned in the chat. Empty string means "no extra input"
-        (the skill body is the full instruction)."""
-        wc = self._worker_config(worker_id)
-        if wc is None:
-            return
-        if worker_id in self._unhealthy:
-            print(f"[health] {worker_id} is unhealthy, skipping spawn_now")
-            return
-        if not self._reserve_worker(worker_id, skill):
-            print(f"[dispatch] {worker_id} already alive or pending (running {self._current_label(worker_id)!r}), spawn_now refused")
-            return
-        ts = _timestamp()
-        log_path = self.log_dir / f"worker-{worker_id}-{ts}.log"
-        resolved_reply = self._resolve_reply_to(reply_to)
-        spawn_task = asyncio.create_task(
-            spawn_one_skill(
-                wc, skill, log_path, tracker=self.worker_state,
-                reply_to=resolved_reply,
-                machine_name=self._machine_name_for(resolved_reply),
-                project_root=self._config.project_root,
-                task=task,
+        (the skill body is the full instruction).
+
+        If `worker_id` is empty / None / "auto", the dispatcher chooses the
+        first idle b1-b6. If all eligible workers are busy, the task enters
+        the global in-memory queue. Explicit worker requests never spill into
+        the global queue; they wait for that worker's dedicated queue.
+        """
+        requested_worker = str(worker_id or "").strip().lower()
+        explicit_worker = requested_worker not in {"", "auto", "*"}
+        if explicit_worker:
+            if self._worker_config(requested_worker) is None:
+                return DispatchResult(
+                    status="rejected",
+                    worker_id=requested_worker,
+                    skill=skill,
+                    task=task,
+                    reason="unknown_worker",
+                    explicit_worker=True,
+                )
+            if requested_worker in self._unhealthy:
+                print(f"[health] {requested_worker} is unhealthy, skipping spawn_now")
+                return DispatchResult(
+                    status="rejected",
+                    worker_id=requested_worker,
+                    skill=skill,
+                    task=task,
+                    reason="worker_unhealthy",
+                    explicit_worker=True,
+                )
+            if self._worker_queue(requested_worker):
+                result = self._queue_for_worker(requested_worker, skill, reply_to, task)
+                self._schedule_drain(requested_worker)
+                return result
+            if self._is_worker_idle(requested_worker):
+                return self._start_spawn(
+                    requested_worker, skill, reply_to, task=task, explicit_worker=True
+                )
+            print(
+                f"[dispatch] {requested_worker} already alive or pending "
+                f"(running {self._current_label(requested_worker)!r}), queued"
             )
-        )
-        self._inflight.add(spawn_task)
-        spawn_task.add_done_callback(
-            lambda t, wid=worker_id, rt=resolved_reply: self._on_spawn_done(t, wid, rt)
+            return self._queue_for_worker(requested_worker, skill, reply_to, task)
+
+        if self._global_queue:
+            result = self._queue_global(skill, reply_to, task)
+            self._schedule_drain()
+            return result
+
+        idle_workers = self._idle_auto_workers()
+        if idle_workers:
+            return self._start_spawn(
+                idle_workers[0], skill, reply_to, task=task, explicit_worker=False
+            )
+        if any(self._worker_config(worker_id) is not None for worker_id in AUTO_WORKER_IDS):
+            print(f"[dispatch] all auto workers busy, queued skill={skill!r}")
+            return self._queue_global(skill, reply_to, task)
+        return DispatchResult(
+            status="rejected",
+            worker_id=None,
+            skill=skill,
+            task=task,
+            reason="no_workers",
+            explicit_worker=False,
         )
 
     async def spawn_freeform(self, worker_id: str, task: str, reply_to: ReplyTarget | None = None) -> None:
@@ -988,6 +1268,7 @@ async def fire_due_entries(
         finally:
             if dispatcher is not None and not dry_run:
                 dispatcher._release_worker(entry.worker)
+                dispatcher._schedule_drain(entry.worker)
 
     # Dispatcher present = live master loop: fire-and-forget so a 30-minute
     # 催开票 task doesn't stall the cron poll loop. The cron loop returns
