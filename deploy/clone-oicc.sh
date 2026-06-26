@@ -43,6 +43,12 @@ done
 repo_url="https://github.com/noemica-io/open-claude-in-chrome.git"
 base_port=18765
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+node_bin="${NODE_BIN:-$(command -v node || true)}"
+
+if [[ -z "$node_bin" ]]; then
+  echo "node not found. Install Node.js 18+ or rerun with NODE_BIN=/absolute/path/to/node." >&2
+  exit 1
+fi
 
 say_dry() {
   printf '[DRY-RUN] %s\n' "$1"
@@ -84,6 +90,20 @@ print(f"    {description}: patched")
 PY
 }
 
+patch_file_if_missing() {
+  local file="$1"
+  local marker="$2"
+  local pattern="$3"
+  local replacement="$4"
+  local description="$5"
+
+  if [[ -f "$file" ]] && grep -Fq "$marker" "$file"; then
+    printf '    %s: already applied\n' "$description"
+    return
+  fi
+  patch_file "$file" "$pattern" "$replacement" "$description"
+}
+
 for ((i = 1; i <= count; i++)); do
   instance_name="oicc-b${i}"
   instance_dir="${script_dir}/${instance_name}"
@@ -93,7 +113,7 @@ for ((i = 1; i <= count; i++)); do
   if [[ "$dry_run" == "1" ]]; then
     say_dry "clone ${repo_url} -> ${instance_dir} if needed"
     say_dry "write ${instance_dir}/config.json port=${port}"
-    say_dry "write launcher ${launcher}"
+    say_dry "write launcher ${launcher} node=${node_bin}"
     say_dry "patch extension and host files for ${instance_name}"
     [[ "$skip_npm" == "1" ]] || say_dry "run npm install in ${instance_dir}/host"
     continue
@@ -129,7 +149,7 @@ set -euo pipefail
 SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 cd "\$SCRIPT_DIR/${instance_name}"
 export OICC_PORT=${port}
-exec node host/native-host.js "\$@"
+exec "${node_bin}" host/native-host.js "\$@"
 EOF
   chmod +x "$launcher"
   printf '  launcher %s written\n' "$launcher"
@@ -154,12 +174,36 @@ EOF
     "$env_hook_mcp" \
     "mcp-server.js getPort honors OICC_PORT"
 
+  host_close_tool=$'// 2b. tabs_close_mcp\nserver.tool(\n  "tabs_close_mcp",\n  "Close a tab in the MCP tab group after a temporary browser operation is complete.",\n  {\n    tabId: z.number().describe("Tab ID to close. Must be a tab in the current group."),\n  },\n  async (args) => callTool("tabs_close_mcp", args)\n);\n\n// 3. navigate'
+  patch_file_if_missing \
+    "${instance_dir}/host/mcp-server.js" \
+    '"tabs_close_mcp"' \
+    '// 3[.] navigate' \
+    "$host_close_tool" \
+    "mcp-server.js adds tabs_close_mcp"
+
+  signal_guard=$'if (process.env.OICC_KEEPALIVE_IGNORE_SIGHUP === "1") {\n  process.on("SIGTERM", () => {});\n  process.on("SIGHUP", () => {});\n} else {\n  process.on("SIGTERM", shutdown);\n  process.on("SIGHUP", shutdown);\n}\nprocess.on("SIGINT", shutdown);\n'
+  patch_file_if_missing \
+    "${instance_dir}/host/mcp-server.js" \
+    'process.on("SIGTERM", () => {})' \
+    'process[.]on[(]"SIGTERM", shutdown[)];\r?\nprocess[.]on[(]"SIGINT", shutdown[)];\r?\n(?:if [(]process[.]env[.]OICC_KEEPALIVE_IGNORE_SIGHUP === "1"[)] [{]\r?\n  process[.]on[(]"SIGHUP", [(][)] => [{][}][)];\r?\n[}] else [{]\r?\n  process[.]on[(]"SIGHUP", shutdown[)];\r?\n[}]\r?\n)?|if [(]process[.]env[.]OICC_KEEPALIVE_IGNORE_SIGHUP !== "1"[)] [{]\r?\n  process[.]on[(]"SIGHUP", shutdown[)];\r?\n[}]|process[.]on[(]"SIGHUP", shutdown[)];' \
+    "$signal_guard" \
+    "mcp-server.js can ignore SIGHUP/SIGTERM for master keepalive"
+
   env_hook_native=$'function getPort() {\n  if (process.env.OICC_PORT) {\n    const p = parseInt(process.env.OICC_PORT, 10);\n    if (!isNaN(p) && p > 0) return p;\n  }\n  const configPath = path.join('
   patch_file \
     "${instance_dir}/host/native-host.js" \
     'function getPort\(\) \{\r?\n  const configPath = path\.join\(' \
     "$env_hook_native" \
     "native-host.js getPort honors OICC_PORT"
+
+  extension_close_handler=$'  async tabs_close_mcp(args) {\n    const { tabId } = args;\n    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };\n    try {\n      await chrome.tabs.remove(tabId);\n      tabGroupTabs.delete(tabId);\n      return { content: [{ type: "text", text: `Closed tab ${tabId}.` }] };\n    } catch (error) {\n      return { content: [{ type: "text", text: `Error closing tab ${tabId}: ${error.message}` }] };\n    }\n  },\n\n  async navigate(args) {'
+  patch_file_if_missing \
+    "${instance_dir}/extension/background.js" \
+    'async tabs_close_mcp(args)' \
+    '  async navigate[(]args[)] [{]' \
+    "$extension_close_handler" \
+    "background.js adds tabs_close_mcp"
 
   if [[ "$skip_npm" != "1" ]]; then
     host_dir="${instance_dir}/host"

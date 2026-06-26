@@ -698,7 +698,9 @@ class _MasterDispatcherImpl:
             from agent.mcp_client import OpenClaudeInChromeClient
             async with asyncio.timeout(8):
                 async with OpenClaudeInChromeClient(
-                    port=wc.mcp_port, mcp_server_js_path=wc.mcp_server_js_path,
+                    port=wc.mcp_port,
+                    mcp_server_js_path=wc.mcp_server_js_path,
+                    require_bridge=True,
                 ) as client:
                     result = await client.call_tool("tabs_context_mcp", {"createIfEmpty": True})
             text = "".join(
@@ -829,7 +831,9 @@ class _MasterDispatcherImpl:
                 try:
                     async with asyncio.timeout(6):
                         async with OpenClaudeInChromeClient(
-                            port=wc.mcp_port, mcp_server_js_path=wc.mcp_server_js_path,
+                            port=wc.mcp_port,
+                            mcp_server_js_path=wc.mcp_server_js_path,
+                            require_bridge=True,
                         ) as client:
                             probe = await client.call_tool("tabs_context_mcp", {"createIfEmpty": True})
                     text = "".join(
@@ -1402,81 +1406,6 @@ async def _knowledge_consolidation_loop(config: MasterConfig) -> None:
             print(f"[knowledge] consolidation failed: {exc}")
 
 
-async def _primary_keepalive_loop(wc: WorkerConfig, log_dir: Path) -> None:
-    """Keep a long-running mcp-server.js PRIMARY alive per worker.
-
-    Architecture problem this solves:
-    - Browser extension's native_messaging stub (native-host.js) tries to TCP
-      connect to mcp_port (18765-18770). It needs SOMEONE listening on the
-      other side.
-    - Previously the only mcp-server.js instances were short-lived (per-task,
-      via OpenClaudeInChromeClient async-with), so TCP port was UNBOUND
-      between tasks → extension's 24s heartbeat retries kept failing →
-      service worker eventually went stale → first task after idle failed.
-    - Now: master spawns ONE long-running mcp-server.js per worker that
-      stays in PRIMARY mode (owns the TCP port). Extension always connects
-      successfully. Per-task worker spawns naturally enter CLIENT mode
-      (mcp-server.js detects port taken and switches).
-
-    Restart on crash with exponential backoff. Skips workers whose
-    host/node_modules is missing (b1/b4/b5/b6 typically have no npm install)
-    instead of spamming retry errors.
-    """
-    label = f"primary-{wc.worker_id}"
-
-    if not wc.mcp_server_js_path.is_file():
-        print(f"[{label}] mcp-server.js not found at {wc.mcp_server_js_path}, skipping")
-        return
-    node_modules = wc.mcp_server_js_path.parent / "node_modules"
-    if not node_modules.is_dir():
-        print(f"[{label}] node_modules missing — run `npm install` in {wc.mcp_server_js_path.parent}. Skipping.")
-        return
-
-    log_path = log_dir / f"mcp-primary-{wc.worker_id}.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    backoff = 3
-    proc: asyncio.subprocess.Process | None = None
-    try:
-        while True:
-            try:
-                env = dict(os.environ)
-                env["OICC_PORT"] = str(wc.mcp_port)
-                with log_path.open("ab") as log_fh:
-                    log_fh.write(f"\n--- {label} spawn at {_timestamp()} port={wc.mcp_port} ---\n".encode("utf-8"))
-                    log_fh.flush()
-                    proc = await asyncio.create_subprocess_exec(
-                        "node", str(wc.mcp_server_js_path),
-                        env=env,
-                        cwd=str(wc.mcp_server_js_path.parent),
-                        stdin=asyncio.subprocess.PIPE,    # keep stdin open; mcp-server.js exits on EOF
-                        stdout=log_fh,
-                        stderr=log_fh,
-                    )
-                    print(f"[{label}] spawned pid={proc.pid} port={wc.mcp_port}", flush=True)
-                    rc = await proc.wait()
-                print(f"[{label}] exited rc={rc}, restarting in {backoff}s", flush=True)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                print(f"[{label}] spawn error: {exc}, retrying in {backoff}s", flush=True)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-    except asyncio.CancelledError:
-        # Master is shutting down — terminate the child cleanly.
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                proc.kill()
-            except Exception:
-                pass
-        raise
-
-
 async def _ensure_cloned(target_dir: Path, repo_url: str, label: str) -> None:
     """If repo_url is set and target_dir is missing or empty, git clone it.
     No-op if already a git repo or no URL configured."""
@@ -1547,13 +1476,11 @@ def _active_skills_require_browser_mcp(skills_dir: Path) -> bool:
     if browser_skill_names:
         print(f"[skills] browser MCP enabled for: {', '.join(browser_skill_names)}")
         return True
-    print("[skills] no active skill requires browser MCP; skipping browser MCP keepalive/health")
+    print("[skills] no active skill requires browser MCP; skipping browser MCP health")
     return False
 
 
 async def main_loop(config: MasterConfig, dry_run: bool = False) -> None:
-    from agent.zombies import kill_zombie_oicc_processes
-
     tracker = WorkerStateTracker()
     paused: list[bool] = [False]
     store = ScheduleStore(config.project_root / SCHEDULE_STATE_PATH)
@@ -1573,28 +1500,12 @@ async def main_loop(config: MasterConfig, dry_run: bool = False) -> None:
         await _ensure_cloned(knowledge_dir, config.knowledge.repo_url, "knowledge")
 
     browser_mcp_enabled = _active_skills_require_browser_mcp(skills_dir)
-    if browser_mcp_enabled:
-        kill_zombie_oicc_processes()
 
     async with asyncio.TaskGroup() as tg:
         if browser_mcp_enabled:
             from agent.health import run_health_checks, log_health_results
-            # PRIMARY keepalive — start FIRST so TCP ports 18765-18770 are bound
-            # before the extension's 24s native_messaging heartbeat fires.
-            # Workers that lack `npm install` (b1/b4/b5/b6 typically) are skipped
-            # inside the loop, no error spam.
-            for wc in config.workers:
-                tg.create_task(
-                    _primary_keepalive_loop(wc, config.log_dir),
-                    name=f"primary-keepalive-{wc.worker_id}",
-                )
-            # Brief settle so PRIMARYs actually bind ports before health probes.
-            await asyncio.sleep(2)
-
-            # Health check NOW — workers find PRIMARY already listening, their
-            # per-probe mcp-server.js enters CLIENT mode and talks to PRIMARY.
-            # If extension isn't connected to PRIMARY yet, the probe will reflect
-            # that and mark unhealthy.
+            # The OICC bridge is an independent process tree. Master only
+            # probes/connects to it; it never owns or restarts bridge workers.
             health_results = await run_health_checks(config.workers)
             unhealthy.update(log_health_results(health_results))
 

@@ -174,5 +174,7 @@ def test_real_ecom_skill() -> None:
 
     full = registry.load_full("ecom-best-source")
     assert len(full.body) > 100
-    assert full.requires_browser_mcp is False
+    assert full.requires_browser_mcp is True
     assert "run_ecom_script" in full.body
+    assert "jd_product.py" in full.body
+    assert "静态结果只覆盖浏览器没拿到的字段" in full.body

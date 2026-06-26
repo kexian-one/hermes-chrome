@@ -29,6 +29,7 @@ async def _probe_one(wc: WorkerConfig) -> WorkerHealth:
             async with OpenClaudeInChromeClient(
                 port=wc.mcp_port,
                 mcp_server_js_path=wc.mcp_server_js_path,
+                require_bridge=True,
             ) as client:
                 await client.list_tools()
         return WorkerHealth(worker_id=wc.worker_id, healthy=True)

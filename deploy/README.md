@@ -8,11 +8,18 @@ This directory sets up 6 independent instances of
 
 - macOS 13+ or Windows 10/11
 - Git — `git` must be on PATH
-- Node.js 18+ — `node` and `npm` must be on PATH
+- Node.js 18+ — `node` and `npm` must be on PATH when running setup. The macOS
+  launcher records the absolute `node` path so Chrome native messaging can start
+  the host even when Chrome has a minimal PATH.
 - Python 3.11+
 - Windows only: PowerShell 5.1+
-- One Chrome-based browser per instance:
-  - b1 → Chrome, b2 → Edge, b3 → Brave, b4 → Vivaldi, b5 → Opera, b6 → Chromium (or your choice)
+- One Chrome-based browser per instance. Current macOS mapping:
+  - b1 → Chrome
+  - b2 → Chrome Beta
+  - b3 → Edge Canary
+  - b4 → Edge Dev
+  - b5 → Edge Beta
+  - b6 → Edge
 
 ---
 
@@ -25,16 +32,26 @@ bash deploy/clone-oicc.sh --count 6 --dry-run
 bash deploy/clone-oicc.sh --count 6
 ```
 
+If Node is installed somewhere Chrome will not normally see, pass it explicitly:
+
+```bash
+NODE_BIN=/absolute/path/to/node bash deploy/clone-oicc.sh --count 6
+```
+
+When `clone-oicc.sh` patches existing OICC extension files, reload each unpacked
+extension once from the browser extensions page so the background service worker
+uses the updated handlers.
+
 Load each unpacked extension from `deploy/oicc-b<N>/extension/`, then register
 the native messaging host for the matching browser:
 
 ```bash
-bash deploy/register-native-host-macos.sh --browser Chrome   --instance 1 --extension-id <chrome-ext-id>
-bash deploy/register-native-host-macos.sh --browser Edge     --instance 2 --extension-id <edge-ext-id>
-bash deploy/register-native-host-macos.sh --browser Brave    --instance 3 --extension-id <brave-ext-id>
-bash deploy/register-native-host-macos.sh --browser Vivaldi  --instance 4 --extension-id <vivaldi-ext-id>
-bash deploy/register-native-host-macos.sh --browser Opera    --instance 5 --extension-id <opera-ext-id>
-bash deploy/register-native-host-macos.sh --browser Chromium --instance 6 --extension-id <chromium-ext-id>
+bash deploy/register-native-host-macos.sh --browser Chrome       --instance 1 --extension-id <chrome-ext-id>
+bash deploy/register-native-host-macos.sh --browser Chrome-Beta  --instance 2 --extension-id <chrome-beta-ext-id>
+bash deploy/register-native-host-macos.sh --browser Edge-Canary  --instance 3 --extension-id <edge-canary-ext-id>
+bash deploy/register-native-host-macos.sh --browser Edge-Dev     --instance 4 --extension-id <edge-dev-ext-id>
+bash deploy/register-native-host-macos.sh --browser Edge-Beta    --instance 5 --extension-id <edge-beta-ext-id>
+bash deploy/register-native-host-macos.sh --browser Edge         --instance 6 --extension-id <edge-ext-id>
 ```
 
 macOS writes native messaging manifests under:
@@ -42,7 +59,12 @@ macOS writes native messaging manifests under:
 | Browser | Manifest directory |
 | --- | --- |
 | Chrome | `~/Library/Application Support/Google/Chrome/NativeMessagingHosts` |
+| Chrome Beta | `~/Library/Application Support/Google/Chrome Beta/NativeMessagingHosts` |
+| Chrome Canary | `~/Library/Application Support/Google/Chrome Canary/NativeMessagingHosts` |
 | Edge | `~/Library/Application Support/Microsoft Edge/NativeMessagingHosts` |
+| Edge Beta | `~/Library/Application Support/Microsoft Edge Beta/NativeMessagingHosts` |
+| Edge Canary | `~/Library/Application Support/Microsoft Edge Canary/NativeMessagingHosts` |
+| Edge Dev | `~/Library/Application Support/Microsoft Edge Dev/NativeMessagingHosts` |
 | Brave | `~/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts` |
 | Vivaldi | `~/Library/Application Support/Vivaldi/NativeMessagingHosts` |
 | Opera | `~/Library/Application Support/com.operasoftware.Opera/NativeMessagingHosts` |
@@ -60,6 +82,36 @@ Run the master on macOS:
 bash start.sh
 tail -f logs/master.err.log
 ```
+
+## OICC bridge lifecycle
+
+The OICC MCP bridge is independent from the master. Keep the
+`deploy/oicc-b<N>/host/mcp-server.js` bridge for each browser alive across
+master restarts; `agent.master` does not own that process lifecycle.
+
+Manage it explicitly with:
+
+```bash
+python -m scripts.oicc_bridge start
+python -m scripts.oicc_bridge status
+python -m scripts.oicc_bridge stop
+```
+
+`bash start.sh` starts the master and may clean up stale Python master/worker
+processes. It also ensures the independent OICC bridge is running before the
+master starts, but it must not kill or otherwise take over the existing bridge
+processes. The master, workers, health checks, and browser-tab smoke checks only
+connect to the configured bridge ports.
+
+After the master is running, `start.sh` runs:
+
+```bash
+python -m scripts.browser_tab_smoke --require-listener --timeout 45
+```
+
+with no `--workers` filter, so b1-b6 must each connect to an existing bridge
+listener, create, navigate, and close a temporary tab before startup is
+considered verified.
 
 ---
 
@@ -115,49 +167,49 @@ for ($i = 1; $i -le 6; $i++) {
 ## Step 2 — Load the extension (unpacked) in each browser
 
 Each browser needs to load its own copy of the extension from the matching
-`oicc-b{n}\` directory.
+`oicc-b{n}\extension\` directory.
 
 ### Chrome (b1)
 
 1. Open `chrome://extensions`
 2. Enable **Developer mode** (top-right toggle)
 3. Click **Load unpacked**
-4. Select `<install-dir>\deploy\oicc-b1` (the directory itself, not a subfolder)
+4. Select `<install-dir>\deploy\oicc-b1\extension`
 5. Note the extension ID shown under the extension name (looks like `abcdefghijklmnop`)
 
 ### Edge (b2)
 
 1. Open `edge://extensions`
 2. Enable **Developer mode**
-3. Click **Load unpacked** → select `oicc-b2`
+3. Click **Load unpacked** → select `oicc-b2\extension`
 4. Note the extension ID
 
 ### Brave (b3)
 
 1. Open `brave://extensions`
 2. Enable **Developer mode**
-3. Click **Load unpacked** → select `oicc-b3`
+3. Click **Load unpacked** → select `oicc-b3\extension`
 4. Note the extension ID
 
 ### Vivaldi (b4)
 
 1. Open `vivaldi://extensions`
 2. Enable **Developer mode**
-3. Click **Load unpacked** → select `oicc-b4`
+3. Click **Load unpacked** → select `oicc-b4\extension`
 4. Note the extension ID
 
 ### Opera (b5)
 
 1. Open `opera://extensions`
 2. Enable **Developer mode**
-3. Click **Load unpacked** → select `oicc-b5`
+3. Click **Load unpacked** → select `oicc-b5\extension`
 4. Note the extension ID
 
 ### 6th browser (b6)
 
 1. Open its extensions page (e.g. `chrome://extensions` for Chromium)
 2. Enable **Developer mode**
-3. Click **Load unpacked** → select `oicc-b6`
+3. Click **Load unpacked** → select `oicc-b6\extension`
 4. Note the extension ID
 
 ---

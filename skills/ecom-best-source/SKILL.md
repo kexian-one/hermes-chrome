@@ -1,7 +1,7 @@
 ---
 name: ecom-best-source
 description: JD/B2B 京东商品找 1688 同款货源、比价、批量找供应商。用于用户说找货源、找同款、1688 比价、哪里进货便宜、给 b2b.jd.com 或 item.jd.com 链接要找可采购货源时。优先用 1688 API/MCP/接口召回和详情，最终筛选只按价格和综合服务分排序，移除发票能力、回头率、响应率；不要依赖外部 huoyuan 文件夹。
-requires_browser_mcp: false
+requires_browser_mcp: true
 ---
 
 # 电商找最优货源
@@ -11,6 +11,7 @@ requires_browser_mcp: false
 ## 核心原则
 
 - 优先接口/MCP，不优先浏览器点 1688 页面。
+- JD/B2B 侧需要价格、已选 SKU 或起购倍数时，必须优先用当前 worker 的浏览器 MCP/OICC 登录态页面一次性读取商品数据；不要把静态 HTML 当作第一信息源。
 - 1688 侧召回、图搜、详情能走 API/MCP 就走 API/MCP；浏览器只做缺工具时的兜底。
 - 最后筛选先硬过滤品牌/品类/SKU/规格，再只按价格和综合服务分排序。移除发票能力、回头率、响应率三个原维度；原 `50:20` 比例归一后为价格 71.43%、综合服务分 28.57%；综合服务分 <3、入驻 <1 年降为不推荐。
 - `SKU不一致`、品牌不匹配、品类不匹配、价格不合适、明确无库存、综合得分低于 60 的候选不能进入最终 CSV；只能进入 rejected / scratch JSON。不要用低价错货凑 Top 6。
@@ -19,7 +20,10 @@ requires_browser_mcp: false
 
 ## 推荐流程
 
-1. 提取 JD 商品信息: title、main_image_url、image_urls、brand、selected_sku、price、buy_multiple。
+1. 提取 JD 商品信息:
+   - 先调用内置工具 `extract_jd_product_browser`。用户给 `item.jd.com/<skuId>.html`、`b2b.jd.com/goods/goods-detail/<skuId>` 或带参数 B2B URL 时，都先提取 `skuId`，再统一打开 `https://b2b.jd.com/goods/goods-detail/<skuId>?sourceurl=/trade/goods-detail&bMallTag=1&buId=456`，在已登录页面一次性读取 `title`、`image_urls`、`item_id`、`selected_sku`、`brand`、`price`/`jd_price`、`buy_multiple`。
+   - 浏览器 MCP 不通、登录态失效、价格没拿到或页面字段为空时，运行 `scripts/jd_product.py` 静态补齐 `title`、`item_id`、`main_image_url`、`image_urls` 后继续后续召回；静态结果只覆盖浏览器没拿到的字段。静态拿不到京东价时不要卡住，京东价/利润率留空或降级。
+   - 每个 worker 只使用运行时注入的浏览器 MCP 工具，不手动指定 OICC 端口、不复用其他 worker 的浏览器实例。临时新开的 tab 操作完成后必须关闭，避免越积越多。
 2. 构造关键词: `brand + category + variant + spec`，不要凭空换原标题里不存在的品类词。英文品牌别名不能裸搜，必须带上品类/规格，例如用 `CLEAR 洗发水 650g`，不要只搜 `CLEAR`。
 3. 召回候选:
    - 首选 Alphashop/1688 MCP: 文搜、图搜、商品详情。
@@ -38,7 +42,7 @@ requires_browser_mcp: false
 - 不要再写 `merged_input.json`、`final.json` 或任何调试 JSON。
 - 不要为了复核重新生成同一个 CSV。
 
-详细数据源路由见 `references/api_mcp_sources.md`。详细筛选规则见 `references/final_filter_rules.md`。数据结构见 `references/data_schema.md`。
+JD/B2B 登录态字段采集见 `references/jd_browser_product_source.md`。详细数据源路由见 `references/api_mcp_sources.md`。详细筛选规则见 `references/final_filter_rules.md`。数据结构见 `references/data_schema.md`。
 
 ## 内置规则脚本
 
@@ -56,7 +60,25 @@ python skills/ecom-best-source/scripts/ecom_config.py --status
 
 该命令只输出脱敏状态，不输出明文 key。后续 API/MCP 脚本应 import `ecom_config.load_ecom_config()`，不要读取外部历史目录。
 
-从 JD / 京东万商 URL 提取目标商品信息:
+从 JD / 京东万商 URL 提取目标商品信息时，先走浏览器 MCP 登录态页面，并优先用内置工具，不要手写大段 JS:
+
+```json
+{"url": "<item.jd.com 或 b2b.jd.com 商品URL>", "output": "jd_product.json", "wait_seconds": 12}
+```
+
+`extract_jd_product_browser` 会使用当前 worker 的浏览器/OICC 端口打开 B2B 页面、读取登录态字段、关闭临时 tab，并把结果写入隐藏 scratch 中的 `jd_product.json`。如果它返回 `missing_fields`，只对这些缺失字段运行静态补缺。
+
+如果内置工具不可用，才按下面的 MCP 原始步骤执行:
+
+1. `tabs_context_mcp` 检查当前 worker 的 MCP tab group。
+2. 需要新页面时调用 `tabs_create_mcp` 新建临时 tab；如果不存在 MCP tab group，可 `tabs_context_mcp(createIfEmpty=true)` 创建。
+3. 调用 `navigate` 时必须传 `{"tabId": <tabId>, "url": "<JD/B2B URL>"}`。
+4. 用 `javascript_tool` 在同一个 `tabId` 内读取 `window.__INITIAL_STATE__`、`window.__PRELOADED_STATE__`、`window.pageConfig`、JSON-LD、meta、页面脚本和可见 DOM，合成 `jd_product.json`。
+   `javascript_tool` 参数必须包含 `{"action": "javascript_exec", "tabId": <tabId>, "text": "<JS表达式>"}`。
+5. 操作结束后调用 `tabs_close_mcp` 关闭临时 tab。
+6. `jd_product.json` 至少保留浏览器拿到的 `title`、`jd_url`、`item_id`、`main_image_url`、`image_urls`；能拿到时必须保留 `brand`、`selected_sku`、`price`/`jd_price`、`buy_multiple`。
+
+浏览器 MCP 不通、登录态失效、价格缺失或页面缺字段时，运行静态补缺脚本并继续:
 
 ```bash
 python skills/ecom-best-source/scripts/jd_product.py --url "<item.jd.com 或 b2b.jd.com 商品URL>" --output jd_product.json
@@ -68,7 +90,7 @@ python skills/ecom-best-source/scripts/jd_product.py --url "<item.jd.com 或 b2b
 {"script": "jd_product.py", "args": ["--url", "<item.jd.com 或 b2b.jd.com 商品URL>", "--output", "jd_product.json"]}
 ```
 
-输出包含 `title`、`jd_url`、`item_id`、`main_image_url`、`image_urls`。如果页面反爬导致标题/图片为空，改用浏览器 MCP 打开该 URL 后用 JS 读 `document.title`、`og:image`、页面商品图数据；不要截图猜标题。
+静态脚本输出包含 `title`、`jd_url`、`item_id`、`main_image_url`、`image_urls`。把静态结果按“只填空字段”的方式合并到浏览器结果里；不要用静态 HTML 覆盖浏览器登录态拿到的价格、SKU、品牌或起购倍数字段。如果浏览器遇验证码、滑块、登录失效或 MCP 连接失败，不要卡住任务；用静态脚本拿其他字段继续，京东价/利润率留空或标记待确认。
 
 从 JD 标题构造 target / query:
 
@@ -99,7 +121,7 @@ python skills/ecom-best-source/scripts/sourcing_pipeline.py --jd-product jd_prod
 - 从 `jd_product.json` 合成 target / query 相关字段。
 - 从 `candidates.json` 读取候选并套用 `sourcing_rules.py` 的最终筛选规则；规则会排除品牌/品类/SKU 不一致的候选。
 - 写 CSV 前会对缺少可判断详情/库存的最终候选补拉 `item_get`，再重新筛选；明确无库存或价格不合适的候选会被剔除，库存字段缺失时才显示“待确认”。
-- 直接写出带 UTF-8 BOM 的最终 CSV，字段包含 Top 6、价格、邮费、起批数、规格匹配、库存、店铺、综合服务分、经营年限、风险说明和完整 1688 链接；不要输出排名、得分、推荐理由列。邮费只展示接口/页面能确认的信息，不计算总价；明确包邮时写“包邮”。
+- 直接写出带 UTF-8 BOM 的最终 CSV，字段包含 Top 6、价格、总进货价、利润率、邮费、起批数、规格匹配、库存、店铺、综合服务分、经营年限、风险说明和完整 1688 链接；不要输出排名、得分、推荐理由列。总进货价 = 1688 SKU 价格 × 用户数量；利润率 = (京东单价 × 用户数量 - 总进货价) / (京东单价 × 用户数量)，百分比保留两位小数。邮费只展示接口/页面能确认的信息，不计算总价；明确包邮时写“包邮”。
 - 在 stdout 返回 `status`、`final_count`、`csv_path` 和 `top3`。回复用户只需要用这些字段，不需要再读 CSV 或规则源码。
 
 只有人明确要求调试规则脚本时，才单独运行最终筛选脚本。正常找货任务禁止在 `sourcing_pipeline.py` 成功后再运行它:
@@ -184,9 +206,9 @@ CSV 要求:
 
 ## 兜底浏览器注意事项
 
-只有在 API/MCP 不可用时才使用浏览器。浏览器路线仍遵守这些约束:
+JD/B2B 商品页默认使用浏览器 MCP，因为它依赖登录态和动态页面数据；1688 页面只有在 API/MCP 不可用时才使用浏览器。浏览器路线仍遵守这些约束:
 
 - 取数据优先 JS 读页面数据，不用截图猜 DOM。
 - 关键词必须来自 JD 标题或 SKU，禁止凭空换词。
 - 图搜失败不算整单失败，降级到文搜候选。
-- 遇验证码、滑块、登录失效，暂停并通知人，不写自动破解策略。
+- 遇验证码、滑块、登录失效或 MCP 断连，不写自动破解策略；改用静态脚本补其他字段继续执行，价格/利润率留空或待确认。

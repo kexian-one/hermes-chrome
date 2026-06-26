@@ -1,5 +1,6 @@
 config.yaml
 state/schedule.yaml
+state/oicc-bridge/
 logs/
 __pycache__/
 *.pyc
@@ -8,6 +9,7 @@ __pycache__/
 *.egg-info/
 deploy/oicc-b*/
 deploy/oicc-b*.cmd
+deploy/oicc-b*.sh
 
 # Real merchant/order data (machine-local, never commit)
 outputs/

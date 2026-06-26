@@ -39,6 +39,8 @@ COLUMNS = [
     ("N", "旺旺状态", 12),
     ("O", "旺旺对话", 40),
     ("P", "备注", 25),
+    ("Q", "总进货价", 12),
+    ("R", "利润率", 12),
 ]
 
 # 样式定义
@@ -66,6 +68,7 @@ def create_comparison_excel(data, output_path):
     """生成比价结果Excel"""
     product_info = data["productInfo"]
     results = data["results"]
+    last_col = COLUMNS[-1][0]
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -74,7 +77,7 @@ def create_comparison_excel(data, output_path):
     # === 表头信息区 ===
 
     # 第1行：标题
-    ws.merge_cells("A1:P1")
+    ws.merge_cells(f"A1:{last_col}1")
     cell = ws["A1"]
     cell.value = "供应商比价结果表"
     cell.font = TITLE_FONT
@@ -82,7 +85,7 @@ def create_comparison_excel(data, output_path):
     ws.row_dimensions[1].height = 36
 
     # 第2行：商品信息
-    ws.merge_cells("A2:P2")
+    ws.merge_cells(f"A2:{last_col}2")
     cell = ws["A2"]
     jd_price = product_info.get("price", "N/A")
     batch_qty = product_info.get("batchQuantity", "N/A")
@@ -97,7 +100,7 @@ def create_comparison_excel(data, output_path):
     ws.row_dimensions[2].height = 22
 
     # 第3行：生成信息
-    ws.merge_cells("A3:P3")
+    ws.merge_cells(f"A3:{last_col}3")
     cell = ws["A3"]
     cell.value = (
         f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} ｜ "
@@ -126,7 +129,8 @@ def create_comparison_excel(data, output_path):
 
     # === 数据行 ===
     data_start_row = 6
-    jd_price_val = float(jd_price) if isinstance(jd_price, (int, float)) else 0
+    jd_price_val = _to_float(jd_price) or 0
+    batch_qty_val = _to_float(batch_qty) or 0
 
     for i, item in enumerate(results):
         row = data_start_row + i
@@ -215,6 +219,17 @@ def create_comparison_excel(data, output_path):
         ws[f"P{row}"] = item.get("note", "")
         ws[f"P{row}"].alignment = LEFT_ALIGN
 
+        unit_price_val = _to_float(unit_price)
+        total_purchase = unit_price_val * batch_qty_val if unit_price_val is not None and batch_qty_val > 0 else None
+        ws[f"Q{row}"] = total_purchase if total_purchase is not None else ""
+        ws[f"Q{row}"].number_format = "#,##0.00"
+        ws[f"Q{row}"].alignment = CENTER_ALIGN
+
+        jd_total = jd_price_val * batch_qty_val if jd_price_val > 0 and batch_qty_val > 0 else None
+        profit_rate = ((jd_total - total_purchase) / jd_total * 100) if jd_total and total_purchase is not None else None
+        ws[f"R{row}"] = f"{profit_rate:.2f}%" if profit_rate is not None else ""
+        ws[f"R{row}"].alignment = CENTER_ALIGN
+
         # 行级样式
         for col_letter, _, _ in COLUMNS:
             cell = ws[f"{col_letter}{row}"]
@@ -243,7 +258,7 @@ def create_comparison_excel(data, output_path):
     exact_match = sum(1 for r in results if r.get("skuMatchLevel") == "完全一致")
     ww_sent = sum(1 for r in results if r.get("wangwangStatus") == "已发送")
 
-    ws.merge_cells(f"A{summary_row}:P{summary_row}")
+    ws.merge_cells(f"A{summary_row}:{last_col}{summary_row}")
     summary_cell = ws[f"A{summary_row}"]
     summary_cell.value = (
         f"总计搜索到：{len(results)}个供应商 ｜ "
@@ -256,12 +271,22 @@ def create_comparison_excel(data, output_path):
 
     # === 冻结窗格和筛选 ===
     ws.freeze_panes = f"A{data_start_row}"
-    ws.auto_filter.ref = f"A{header_row}:P{last_data_row - 1}"
+    ws.auto_filter.ref = f"A{header_row}:{last_col}{last_data_row - 1}"
 
     # 保存
     wb.save(output_path)
     print(f"Excel saved: {output_path}")
     return output_path
+
+
+def _to_float(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    import re
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+    return float(match.group(0)) if match else None
 
 
 def main():

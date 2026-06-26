@@ -7,10 +7,15 @@ from pathlib import Path
 import pytest
 
 from agent.builtin_tools import (
+    BROWSER_BUILTIN_TOOL_NAMES,
+    BROWSER_BUILTIN_TOOLS,
     BUILTIN_TOOLS,
     BUILTIN_TOOL_NAMES,
+    _extract_oicc_tab_id,
+    _jd_b2b_detail_url,
     execute_builtin,
     is_builtin,
+    is_browser_builtin,
 )
 
 
@@ -28,6 +33,36 @@ def test_is_builtin() -> None:
     assert is_builtin("run_ecom_script") is True
     assert is_builtin("javascript_tool") is False
     assert is_builtin("") is False
+    assert is_browser_builtin("extract_jd_product_browser") is True
+    assert is_browser_builtin("write_file") is False
+
+
+def test_browser_builtin_tools_are_separate_from_non_browser_tools() -> None:
+    assert "extract_jd_product_browser" in BROWSER_BUILTIN_TOOL_NAMES
+    assert "extract_jd_product_browser" not in BUILTIN_TOOL_NAMES
+    names = [tool["function"]["name"] for tool in BROWSER_BUILTIN_TOOLS]
+    assert names == ["extract_jd_product_browser"]
+
+
+def test_extract_oicc_tab_id_from_context_text() -> None:
+    text = (
+        '{"availableTabs":[{"tabId":21083066,"title":"about:blank"}],"tabGroupId":1}\n'
+        'Tab Context: tabId 21083066'
+    )
+    assert _extract_oicc_tab_id(text) == 21083066
+
+
+def test_jd_url_normalizes_to_b2b_detail_url() -> None:
+    assert _jd_b2b_detail_url("https://item.jd.com/10177709350354.html") == (
+        "https://b2b.jd.com/goods/goods-detail/10177709350354"
+        "?sourceurl=/trade/goods-detail&bMallTag=1&buId=456"
+    )
+    assert _jd_b2b_detail_url(
+        "https://b2b.jd.com/goods/goods-detail/10212040410264?sourceurl=/trade/goods-detail&bMallTag=1&buId=456"
+    ) == (
+        "https://b2b.jd.com/goods/goods-detail/10212040410264"
+        "?sourceurl=/trade/goods-detail&bMallTag=1&buId=456"
+    )
 
 
 def test_write_file_writes_relative_path(tmp_path: Path) -> None:

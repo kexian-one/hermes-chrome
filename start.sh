@@ -92,14 +92,14 @@ fi
 echo "[start.sh] killing old project processes..."
 
 python_re='python(3)? .*agent\.(master|worker|bot)'
-node_re='node .*deploy/oicc-b[0-9]+/host/mcp-server\.js'
+master_re='python(3)? .*agent\.master'
 killed=0
 
 while IFS= read -r line; do
   pid="${line%% *}"
   cmd="${line#* }"
   [[ "$pid" == "$$" ]] && continue
-  if [[ "$cmd" =~ $python_re || "$cmd" =~ $node_re ]]; then
+  if [[ "$cmd" =~ $python_re ]]; then
     kill -9 "$pid" 2>/dev/null || true
     echo "  killed pid=${pid}"
     killed=$((killed + 1))
@@ -111,6 +111,20 @@ if [[ "$killed" == "0" ]]; then
 fi
 
 sleep 0.8
+
+find_existing_master_pid() {
+  local line candidate cmd
+  while IFS= read -r line; do
+    candidate="${line%% *}"
+    cmd="${line#* }"
+    [[ "$candidate" == "$$" ]] && continue
+    if [[ "$cmd" =~ $master_re ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(ps -axo pid=,command= | sed 's/^ *//')
+  return 1
+}
 
 echo "[start.sh] checking macOS native-messaging manifests..."
 "${PY_CMD[@]}" - "$ROOT" <<'PY'
@@ -137,7 +151,12 @@ if not isinstance(browsers, dict):
 home = Path.home()
 targets = {
     "chrome": home / "Library/Application Support/Google/Chrome/NativeMessagingHosts",
+    "chrome-beta": home / "Library/Application Support/Google/Chrome Beta/NativeMessagingHosts",
+    "chrome-canary": home / "Library/Application Support/Google/Chrome Canary/NativeMessagingHosts",
     "edge": home / "Library/Application Support/Microsoft Edge/NativeMessagingHosts",
+    "edge-beta": home / "Library/Application Support/Microsoft Edge Beta/NativeMessagingHosts",
+    "edge-canary": home / "Library/Application Support/Microsoft Edge Canary/NativeMessagingHosts",
+    "edge-dev": home / "Library/Application Support/Microsoft Edge Dev/NativeMessagingHosts",
     "brave": home / "Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts",
     "vivaldi": home / "Library/Application Support/Vivaldi/NativeMessagingHosts",
     "opera": home / "Library/Application Support/com.operasoftware.Opera/NativeMessagingHosts",
@@ -169,20 +188,40 @@ PY
 mkdir -p logs
 log_err="${ROOT}/logs/master.err.log"
 log_out="${ROOT}/logs/master.out.log"
+bridge_log="${ROOT}/logs/oicc-bridge-supervisor.log"
 ts="$(date '+%Y-%m-%d %H:%M:%S')"
 printf '\n========== restart %s ==========\n' "$ts" >> "$log_err"
 printf '\n========== restart %s ==========\n' "$ts" >> "$log_out"
+printf '\n========== ensure %s ==========\n' "$ts" >> "$bridge_log"
 
-echo "[start.sh] launching master..."
-nohup "${PY_CMD[@]}" -u -m agent.master >> "$log_out" 2>> "$log_err" &
-pid=$!
-sleep 0.5
-
-if ! kill -0 "$pid" 2>/dev/null; then
-  echo "[start.sh] master exited immediately. Check ${log_err}" >&2
+echo "[start.sh] ensuring independent oicc-bridge..."
+if ! "${PY_CMD[@]}" -m scripts.oicc_bridge start; then
+  echo "[start.sh] oicc-bridge failed to start. Check ${bridge_log}" >&2
   exit 1
 fi
 
-echo "[start.sh] master started, pid=${pid}"
+existing_master_pid="$(find_existing_master_pid || true)"
+if [[ -n "$existing_master_pid" ]]; then
+  pid="$existing_master_pid"
+  echo "[start.sh] master already running, pid=${pid}"
+else
+  echo "[start.sh] launching master..."
+  nohup "${PY_CMD[@]}" -u -m agent.master >> "$log_out" 2>> "$log_err" &
+  pid=$!
+  sleep 0.5
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "[start.sh] master exited immediately. Check ${log_err}" >&2
+    exit 1
+  fi
+  echo "[start.sh] master started, pid=${pid}"
+fi
+
+echo "[start.sh] verifying browser tab open/close for b1-b6..."
+if ! "${PY_CMD[@]}" -m scripts.browser_tab_smoke --require-listener --timeout 45; then
+  echo "[start.sh] browser tab smoke failed. Master is still running; check ${log_err}" >&2
+  exit 1
+fi
+echo "[start.sh] browser tab smoke passed"
 echo "[start.sh] main log: ${log_err}"
 echo "[start.sh] tail with: tail -f ${log_err}"

@@ -212,6 +212,18 @@ async def test_restart_launch_failure_marks_reason(tmp_path: Path):
 
 
 def test_known_browser_list():
-    expected = {"chrome", "edge", "brave", "vivaldi", "opera", "chromium"}
+    expected = {
+        "chrome",
+        "chrome-beta",
+        "chrome-canary",
+        "edge",
+        "edge-beta",
+        "edge-canary",
+        "edge-dev",
+        "brave",
+        "vivaldi",
+        "opera",
+        "chromium",
+    }
     assert set(PROCESS_NAME_BY_BROWSER.keys()) == expected
     assert set(MAC_APP_BY_BROWSER.keys()) == expected

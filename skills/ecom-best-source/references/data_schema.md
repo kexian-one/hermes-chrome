@@ -8,6 +8,7 @@
 {
   "title": "JD 商品完整标题",
   "jd_url": "JD/B2B URL",
+  "item_id": "JD 商品 ID",
   "main_image_url": "JD 主图 URL",
   "image_urls": ["JD 商品图 URL"],
   "brand": "品牌主名",
@@ -22,6 +23,10 @@
   "buy_multi_mode": "hard | soft | none"
 }
 ```
+
+JD/B2B target 字段优先来自浏览器 MCP 登录态页面。用户给普通 `item.jd.com/<skuId>.html` 时，只用该链接提取 `skuId`，实际价格采集统一打开 B2B 详情 URL。`jd_product.py` 静态 HTML 结果只补浏览器缺失的 `title`、`item_id`、`main_image_url`、`image_urls`，不能覆盖浏览器拿到的 `brand`、`selected_sku`、`price`/`jd_price`、`buy_multiple`。
+
+最终 CSV 里的 `总进货价(元)` 按 `1688 unitPrice * target.buy_multiple` 计算；`利润率` 按 `(target.jd_price * target.buy_multiple - 总进货价) / (target.jd_price * target.buy_multiple)` 计算并保留两位百分比。缺京东单价或缺用户数量时留空，不编造。
 
 发票能力、回头率、响应率不再是 `final` 的顶层字段或打分维度；接口原始返回若包含这些信息，只能留在 `detail` / `seller_info` 原始详情里。
 

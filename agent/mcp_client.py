@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,18 +36,29 @@ class OpenClaudeInChromeClient:
         port: int,
         mcp_server_js_path: Path,
         node_bin: str = "node",
+        extra_env: dict[str, str] | None = None,
+        require_bridge: bool = False,
     ) -> None:
         self._port = port
         self._script = Path(mcp_server_js_path)
         self._node = node_bin
+        self._extra_env = dict(extra_env or {})
+        self._require_bridge = require_bridge
         self._session: ClientSession | None = None
         self._stack: AsyncExitStack | None = None
 
     async def __aenter__(self) -> "OpenClaudeInChromeClient":
         self._stack = AsyncExitStack()
 
+        if self._require_bridge and not _tcp_port_is_listening(self._port):
+            raise OSError(
+                f"OICC bridge is not listening on 127.0.0.1:{self._port}. "
+                "Start the independent oicc-bridge before connecting."
+            )
+
         env = os.environ.copy()
         env["OICC_PORT"] = str(self._port)
+        env.update(self._extra_env)
 
         params = StdioServerParameters(
             command=self._node,
@@ -103,3 +115,11 @@ def tools_to_openai_functions(tools: list[Tool]) -> list[dict]:
         }
         for t in tools
     ]
+
+
+def _tcp_port_is_listening(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.4):
+            return True
+    except OSError:
+        return False

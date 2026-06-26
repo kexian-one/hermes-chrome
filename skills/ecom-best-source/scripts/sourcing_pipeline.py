@@ -16,6 +16,8 @@ from sourcing_rules import run_pipeline
 CSV_HEADERS = [
     "1688商品标题",
     "价格(元)",
+    "总进货价(元)",
+    "利润率",
     "邮费",
     "起批数",
     "规格匹配",
@@ -304,12 +306,13 @@ def _load_pipeline_payload(
 
 def write_csv(result: dict[str, Any], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    target = result.get("target") if isinstance(result.get("target"), dict) else {}
     with output_path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_HEADERS)
         writer.writeheader()
         row_num = 1
         for idx, item in enumerate(result.get("final") or [], start=1):
-            writer.writerow(_csv_row(idx, item))
+            writer.writerow(_csv_row(idx, item, target))
             row_num += 1
         while row_num < 8:
             writer.writerow({})
@@ -317,15 +320,22 @@ def write_csv(result: dict[str, Any], output_path: Path) -> None:
         writer.writerow({CSV_HEADERS[1]: _safe_cell(_b9_summary_text(result))})
 
 
-def _csv_row(rank: int, item: dict[str, Any]) -> dict[str, Any]:
+def _csv_row(rank: int, item: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
     del rank
     price = _first_number(item, "unitPrice", "unit_price", "price")
+    quantity = _target_quantity(target)
+    purchase_total = price * quantity if price is not None and quantity > 0 else None
+    jd_price = _first_number(target, "jd_price", "jdPrice", "price")
+    jd_total = jd_price * quantity if jd_price is not None and quantity > 0 else None
+    profit_rate = _profit_rate(jd_total, purchase_total)
     moq = _first_value(item, "MOQ", "moq", "minOrderQuantity")
     service = _service_score_value(item)
     shop_year = _shop_year_value(item)
     return {
         "1688商品标题": _safe_cell(str(item.get("title") or "")),
         "价格(元)": _format_number(price),
+        "总进货价(元)": _format_number(purchase_total),
+        "利润率": _format_percent(profit_rate),
         "邮费": _safe_cell(_shipping_text(item)),
         "起批数": moq or "",
         "规格匹配": _safe_cell(str(item.get("skuMatchLevel") or "")),
@@ -336,6 +346,22 @@ def _csv_row(rank: int, item: dict[str, Any]) -> dict[str, Any]:
         "风险说明": _safe_cell(_risk_text(item)),
         "1688链接": _safe_cell(str(item.get("link") or item.get("detail_url") or "")),
     }
+
+
+def _target_quantity(target: dict[str, Any]) -> int:
+    return _to_int(
+        target.get("buy_multiple")
+        or target.get("quantity")
+        or target.get("qty")
+        or target.get("batchQuantity")
+        or target.get("purchaseMultiple")
+    )
+
+
+def _profit_rate(jd_total: float | None, purchase_total: float | None) -> float | None:
+    if jd_total is None or jd_total <= 0 or purchase_total is None:
+        return None
+    return (jd_total - purchase_total) / jd_total * 100
 
 
 def _summary_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -643,6 +669,12 @@ def _format_number(value: float | None) -> str:
     if float(value).is_integer():
         return str(int(value))
     return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _format_percent(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"{value:.2f}%"
 
 
 def _safe_cell(value: str) -> str:

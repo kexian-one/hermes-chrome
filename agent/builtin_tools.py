@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import asyncio
 from pathlib import Path
+from typing import Any
 
 
 BUILTIN_TOOLS: list[dict] = [
@@ -183,8 +186,53 @@ BUILTIN_TOOLS: list[dict] = [
 BUILTIN_TOOL_NAMES: frozenset[str] = frozenset(t["function"]["name"] for t in BUILTIN_TOOLS)
 
 
+BROWSER_BUILTIN_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_jd_product_browser",
+            "description": (
+                "Use the current worker's logged-in browser MCP/OICC session to open "
+                "an item.jd.com or b2b.jd.com product page, extract dynamic product "
+                "fields such as title, images, selected SKU, JD/B2B price, stock and "
+                "freight text, then write a jd_product JSON file. Use this before "
+                "jd_product.py because static HTML cannot reliably see logged-in "
+                "B2B prices. Any JD URL is normalized by skuId to the B2B goods-detail "
+                "URL before navigation, and the temporary tab is closed afterward."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "JD or B2B product URL to open in the current worker browser.",
+                    },
+                    "output": {
+                        "type": "string",
+                        "description": "Output JSON filename. Defaults to jd_product.json in ecom scratch.",
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "description": "Seconds to wait after navigation before reading the page. Default 12, max 30.",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+]
+
+BROWSER_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset(
+    t["function"]["name"] for t in BROWSER_BUILTIN_TOOLS
+)
+
+
 def is_builtin(tool_name: str) -> bool:
     return tool_name in BUILTIN_TOOL_NAMES
+
+
+def is_browser_builtin(tool_name: str) -> bool:
+    return tool_name in BROWSER_BUILTIN_TOOL_NAMES
 
 
 def _resolve_safe(path_str: str, project_root: Path, *, for_write: bool = True) -> Path:
@@ -268,6 +316,415 @@ def execute_builtin(
     if tool_name == "run_ecom_script":
         return _run_ecom_script(args, project_root)
     return json.dumps({"error": f"unknown builtin tool: {tool_name}"})
+
+
+async def execute_browser_builtin(
+    tool_name: str,
+    arguments_json: str,
+    project_root: Path,
+    *,
+    mcp: Any,
+) -> str:
+    try:
+        args = json.loads(arguments_json) if arguments_json else {}
+    except json.JSONDecodeError as exc:
+        return json.dumps({"error": f"invalid JSON arguments: {exc}"})
+
+    if tool_name == "extract_jd_product_browser":
+        return await _extract_jd_product_browser(args, project_root, mcp=mcp)
+    return json.dumps({"error": f"unknown browser builtin tool: {tool_name}"})
+
+
+def _tool_result_text(result: Any) -> str:
+    content = getattr(result, "content", result)
+    if not isinstance(content, list):
+        return str(content)
+
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, dict):
+            if "text" in item:
+                parts.append(str(item.get("text") or ""))
+            else:
+                parts.append(json.dumps(item, ensure_ascii=False))
+        else:
+            parts.append(str(item))
+    return "\n".join(parts)
+
+
+def _decode_leading_json_object(text: str) -> dict[str, Any] | None:
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        value, _idx = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _extract_oicc_tab_id(text: str) -> int | None:
+    payload = _decode_leading_json_object(text)
+    if payload:
+        tabs = payload.get("availableTabs")
+        if isinstance(tabs, list) and tabs:
+            first = tabs[0]
+            if isinstance(first, dict):
+                tab_id = first.get("tabId") or first.get("id")
+                if isinstance(tab_id, int):
+                    return tab_id
+
+    for pattern in (
+        r"\btabId\b[\"']?\s*[:= ]\s*(\d+)",
+        r"\bid\b[\"']?\s*[:= ]\s*(\d+)",
+        r"\bTab ID\b[: ]+(\d+)",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _extract_oicc_tab_ids(text: str) -> list[int]:
+    payload = _decode_leading_json_object(text)
+    ids: list[int] = []
+    if payload:
+        tabs = payload.get("availableTabs")
+        if isinstance(tabs, list):
+            for tab in tabs:
+                if isinstance(tab, dict):
+                    tab_id = tab.get("tabId") or tab.get("id")
+                    if isinstance(tab_id, int):
+                        ids.append(tab_id)
+    if ids:
+        return ids
+    for left, right in re.findall(r'"tabId"\s*:\s*(\d+)|\btabId\b\s+(\d+)', text):
+        ids.append(int(left or right))
+    return list(dict.fromkeys(ids))
+
+
+def _extract_created_oicc_tab_id(text: str) -> int | None:
+    match = re.search(r"Created new tab[.] Tab ID:\s*(\d+)", text)
+    if match:
+        return int(match.group(1))
+    return _extract_oicc_tab_id(text)
+
+
+def _decode_javascript_payload(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if not stripped:
+        return {}
+    try:
+        value: Any = json.loads(stripped)
+    except json.JSONDecodeError:
+        payload = _decode_leading_json_object(stripped)
+        return payload or {"raw_text": stripped}
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return {"raw_text": value}
+        return decoded if isinstance(decoded, dict) else {"raw": decoded}
+    return value if isinstance(value, dict) else {"raw": value}
+
+
+async def _mcp_call_text(mcp: Any, tool_name: str, args: dict[str, Any]) -> str:
+    result = await mcp.call_tool(tool_name, args)
+    return _tool_result_text(result)
+
+
+async def _wait_for_browser_context(mcp: Any, *, attempts: int = 16) -> str:
+    last_text = ""
+    for _attempt in range(attempts):
+        last_text = await _mcp_call_text(mcp, "tabs_context_mcp", {})
+        if "browser extension is not connected" not in last_text.lower():
+            return last_text
+        await asyncio.sleep(2)
+    return last_text
+
+
+async def _open_temporary_browser_tab(mcp: Any) -> tuple[int | None, str]:
+    context_text = await _wait_for_browser_context(mcp)
+    if "browser extension is not connected" in context_text.lower():
+        return None, context_text
+    if "no mcp tab group exists" in context_text.lower():
+        created_group_text = await _mcp_call_text(mcp, "tabs_context_mcp", {"createIfEmpty": True})
+        return _extract_oicc_tab_id(created_group_text), created_group_text
+    create_text = await _mcp_call_text(mcp, "tabs_create_mcp", {})
+    return _extract_created_oicc_tab_id(create_text), create_text or context_text
+
+
+async def _close_temporary_browser_tab(mcp: Any, tab_id: int) -> dict[str, Any]:
+    close_error = ""
+    method = "tabs_close_mcp"
+    message = ""
+    try:
+        close_text = await _mcp_call_text(mcp, "tabs_close_mcp", {"tabId": tab_id})
+        message = close_text
+        closed = "closed tab" in close_text.lower()
+        if closed:
+            return await _verified_close_status(mcp, tab_id, method, close_text)
+        close_error = close_text
+    except Exception as exc:
+        close_error = str(exc)
+
+    if close_error:
+        key = "cmd+w" if sys.platform == "darwin" else "ctrl+w"
+        method = f"computer:{key}"
+        try:
+            fallback = await _mcp_call_text(mcp, "computer", {
+                "action": "key",
+                "tabId": tab_id,
+                "text": key,
+            })
+            message = fallback
+        except Exception as fallback_exc:
+            return {
+                "ok": False,
+                "method": method,
+                "error": _truncate_text(close_error, 500),
+                "fallback_error": str(fallback_exc),
+            }
+        status = await _verified_close_status(mcp, tab_id, method, fallback)
+        if close_error:
+            status["error"] = _truncate_text(close_error, 500)
+        return status
+    return {"ok": False, "method": "tabs_close_mcp", "error": "empty close response"}
+
+
+async def _verified_close_status(mcp: Any, tab_id: int, method: str, message: str) -> dict[str, Any]:
+    await asyncio.sleep(0.2)
+    try:
+        context = await _mcp_call_text(mcp, "tabs_context_mcp", {})
+        still_open = tab_id in _extract_oicc_tab_ids(context)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "method": method,
+            "message": _truncate_text(message, 500),
+            "verify_error": str(exc),
+        }
+    return {
+        "ok": not still_open,
+        "method": method,
+        "message": _truncate_text(message, 500),
+        "verified": True,
+    }
+
+
+def _jd_sku_id_from_url(url: str) -> str:
+    patterns = [
+        r"item[.]jd[.]com/(\d+)[.]html",
+        r"b2b[.]jd[.]com/goods/goods-detail/(\d+)",
+        r"(?:sku|skuId|wareId|productId|itemId|goodsId)=([0-9]{6,})",
+        r"/(\d{6,})(?:[/?#]|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _jd_b2b_detail_url(raw_url: str) -> str:
+    sku_id = _jd_sku_id_from_url(raw_url)
+    if not sku_id:
+        return ""
+    return (
+        f"https://b2b.jd.com/goods/goods-detail/{sku_id}"
+        "?sourceurl=/trade/goods-detail&bMallTag=1&buId=456"
+    )
+
+
+_JD_BROWSER_EXTRACT_JS = r"""
+(() => {
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  };
+  const text = clean(document.body ? document.body.innerText : '');
+  const html = document.documentElement ? document.documentElement.outerHTML : '';
+  const url = location.href;
+  const itemId =
+    (url.match(/(?:goods-detail|item\.jd\.com\/)(?:\/)?(\d+)/) || [])[1] ||
+    (text.match(/商品编码[:：]\s*(\d{6,})/) || [])[1] ||
+    (html.match(/(?:skuId|wareId|itemId|productId)["']?\s*[:=]\s*["']?(\d{6,})/i) || [])[1] ||
+    '';
+  const title = clean(
+    document.querySelector('h1')?.innerText ||
+    document.querySelector('[class*=goods][class*=title]')?.innerText ||
+    document.querySelector('[class*=title]')?.innerText ||
+    document.title
+  );
+  const priceText =
+    clean(document.querySelector('.goodsdetail-price__purchase .right')?.innerText) ||
+    clean(document.querySelector('.goodsdetail-price .right')?.innerText) ||
+    clean(document.querySelector('.num1')?.innerText) ||
+    clean((text.match(/采购价\s*[¥￥]?\s*[0-9]+(?:\.[0-9]+)?/) || [])[0]);
+  const priceMatch = priceText.match(/[0-9]+(?:\.[0-9]+)?/);
+  const price = priceMatch ? Number(priceMatch[0]) : null;
+  const brand =
+    clean((text.match(/品牌[:：]\s*([^ 商品编码规格参数]{1,30})/) || [])[1]) ||
+    clean(document.querySelector('[class*=brand]')?.innerText).replace(/^品牌[:：]?/, '');
+  const shopName =
+    clean(document.querySelector('[class*=shop][class*=name]')?.innerText) ||
+    clean((text.match(/([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40}(?:专营店|旗舰店|官方店|店铺|超市|商行|贸易|百货店))/) || [])[1]);
+  const stockText = clean((text.match(/(现货[^，。 ]{0,30}|有货[^，。 ]{0,30}|无货[^，。 ]{0,30}|预计[^，。 ]{0,30}发货)/) || [])[1]);
+  const freightText = clean((text.match(/((?:实付|满|不满|免运费|运费)[^。；\n]{0,80}(?:免运费|运费|元))/) || [])[1]);
+  const buyMultiple = Number((text.match(/(?:起订|起批|最小起购|起购)[^0-9]{0,8}(\d+)/) || [])[1] || '') || null;
+  const selectedSku =
+    clean(document.querySelector('[class*=sku] [class*=selected]')?.innerText) ||
+    clean((title.match(/(\d+\s*(?:g|克|kg|千克|ml|mL|毫升|枚|只|瓶|盒|袋)[^，, ]*)/) || [])[1]);
+  const allImages = [...document.images]
+    .map((img) => img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-img') || img.getAttribute('data-original'))
+    .filter(Boolean)
+    .map((src) => src.startsWith('//') ? location.protocol + src : src);
+  const imageUrls = [...new Set(allImages)]
+    .filter((src) => /360buyimg|jdimg|m\.360buyimg/.test(src))
+    .filter((src) => !/imagetools|logo|n-header|blank|gif/i.test(src))
+    .slice(0, 30);
+  const mainImageUrl =
+    imageUrls.find((src) => /\/n1\/|s800x800|m\.360buyimg\.com\/n1/.test(src)) ||
+    imageUrls[0] ||
+    '';
+  const scoreMatches = [...text.matchAll(/(物流|售后|商品|服务)\s*([0-9](?:\.[0-9])?)/g)]
+    .slice(0, 10)
+    .map((m) => `${m[1]}${m[2]}`);
+  return JSON.stringify({
+    source: 'browser_mcp',
+    jd_url: url,
+    item_id: itemId,
+    title,
+    brand,
+    selected_sku: selectedSku,
+    price,
+    jd_price: price,
+    price_text: priceText,
+    main_image_url: mainImageUrl,
+    image_urls: imageUrls,
+    shop_name: shopName,
+    stock_text: stockText,
+    freight_text: freightText,
+    buy_multiple: buyMultiple,
+    service_scores: scoreMatches,
+    text_start: text.slice(0, 1500),
+  });
+})()
+"""
+
+
+async def _extract_jd_product_browser(args: dict, project_root: Path, *, mcp: Any) -> str:
+    raw_url = args.get("url")
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        return json.dumps({"error": "extract_jd_product_browser requires url (str)"}, ensure_ascii=False)
+    requested_url = raw_url.strip()
+    b2b_url = _jd_b2b_detail_url(requested_url)
+    if not b2b_url:
+        return json.dumps({
+            "error": "url must contain a JD skuId from item.jd.com or b2b.jd.com",
+        }, ensure_ascii=False)
+
+    output = args.get("output", "jd_product.json")
+    if not isinstance(output, str) or not output.strip():
+        output = "jd_product.json"
+
+    try:
+        wait_seconds = int(args.get("wait_seconds", 12))
+    except (TypeError, ValueError):
+        wait_seconds = 12
+    wait_seconds = max(3, min(wait_seconds, 30))
+
+    env_root = os.environ.get("WORKER_PROJECT_ROOT", "").strip()
+    if env_root:
+        project_root = Path(env_root)
+    project_root = project_root.resolve()
+    target = Path(_resolve_ecom_runtime_path(output, project_root, for_output=True)).resolve()
+    try:
+        rel = target.relative_to(project_root)
+    except ValueError:
+        return json.dumps({
+            "error": f"output path {target} is outside project root {project_root}",
+        }, ensure_ascii=False)
+
+    tab_id, context_text = await _open_temporary_browser_tab(mcp)
+    close_status: dict[str, Any] | None = None
+    if tab_id is None:
+        response = {
+            "ok": False,
+            "error": "could not create a temporary browser tab from OICC",
+            "fallback_required": "run jd_product.py static extraction and continue without JD/B2B price if needed",
+            "context": _truncate_text(context_text, 2000),
+        }
+    else:
+        try:
+            navigate_text = await _mcp_call_text(mcp, "navigate", {"tabId": tab_id, "url": b2b_url})
+            if "browser extension is not connected" in navigate_text.lower():
+                response = {
+                    "ok": False,
+                    "error": "browser extension is not connected",
+                    "fallback_required": "run jd_product.py static extraction and continue without JD/B2B price if needed",
+                    "context": _truncate_text(navigate_text, 2000),
+                }
+            else:
+                await asyncio.sleep(wait_seconds)
+                js_text = await _mcp_call_text(
+                    mcp,
+                    "javascript_tool",
+                    {"action": "javascript_exec", "tabId": tab_id, "text": _JD_BROWSER_EXTRACT_JS},
+                )
+                product = _decode_javascript_payload(js_text)
+                if not isinstance(product, dict):
+                    product = {"raw": product}
+
+                product.setdefault("source", "browser_mcp")
+                product["jd_url"] = product.get("jd_url") or b2b_url
+                product["b2b_url"] = b2b_url
+                product["requested_url"] = requested_url
+                product["item_id"] = product.get("item_id") or _jd_sku_id_from_url(requested_url)
+                if product.get("price") is None and isinstance(product.get("price_text"), str):
+                    match = re.search(r"[0-9]+(?:\.[0-9]+)?", product["price_text"])
+                    if match:
+                        product["price"] = float(match.group(0))
+                        product["jd_price"] = product["price"]
+                if product.get("main_image_url") and not product.get("image_urls"):
+                    product["image_urls"] = [product["main_image_url"]]
+
+                missing = [
+                    field for field in ("title", "item_id", "main_image_url", "price")
+                    if not product.get(field)
+                ]
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(product, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                response = {
+                    "ok": True,
+                    "path": str(rel),
+                    "tab_id": tab_id,
+                    "opened_url": b2b_url,
+                    "requested_url": requested_url,
+                    "missing_fields": missing,
+                    "product": {
+                        "title": product.get("title"),
+                        "item_id": product.get("item_id"),
+                        "brand": product.get("brand"),
+                        "selected_sku": product.get("selected_sku"),
+                        "price": product.get("price"),
+                        "price_text": product.get("price_text"),
+                        "main_image_url": product.get("main_image_url"),
+                        "image_count": len(product.get("image_urls") or []),
+                        "shop_name": product.get("shop_name"),
+                        "stock_text": product.get("stock_text"),
+                        "freight_text": product.get("freight_text"),
+                    },
+                }
+        finally:
+            close_status = await _close_temporary_browser_tab(mcp, tab_id)
+    if close_status is not None:
+        response["close_tab"] = close_status
+    return json.dumps(response, ensure_ascii=False)
 
 
 # Paths/files write_file is forbidden to touch (project source + config + state)

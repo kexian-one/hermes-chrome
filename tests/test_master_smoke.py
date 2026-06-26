@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import os
 import asyncio
+import inspect
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import agent.master as master_module
 from agent.channels import ReplyTarget
 from agent.config import LLMSettings, MasterConfig, WorkerConfig
 from agent.master import (
@@ -48,6 +50,48 @@ class _FakeProcess:
 
     async def wait(self) -> int:
         return self._exit_code
+
+
+def test_master_loop_does_not_kill_independent_oicc_bridge() -> None:
+    source = inspect.getsource(master_module.main_loop)
+
+    assert "kill_zombie_oicc_processes" not in source
+
+
+def test_start_sh_does_not_kill_independent_oicc_bridge() -> None:
+    start_sh = Path(__file__).resolve().parents[1] / "start.sh"
+    startup_before_master = start_sh.read_text(encoding="utf-8").split(
+        'echo "[start.sh] launching master..."',
+        maxsplit=1,
+    )[0]
+
+    assert "node_re=" not in startup_before_master
+    assert "deploy/oicc-b" not in startup_before_master
+    assert "mcp-server" not in startup_before_master
+
+
+def test_start_sh_runs_b1_to_b6_tab_smoke_after_master_launch() -> None:
+    start_sh = Path(__file__).resolve().parents[1] / "start.sh"
+    text = start_sh.read_text(encoding="utf-8")
+
+    launch_index = text.index('echo "[start.sh] launching master..."')
+    smoke_index = text.index("scripts.browser_tab_smoke")
+    smoke_line = next(line for line in text.splitlines() if "scripts.browser_tab_smoke" in line)
+
+    assert launch_index < smoke_index
+    assert "--workers" not in smoke_line
+    assert "--require-listener" in smoke_line
+    assert "--timeout 45" in smoke_line
+
+
+def test_start_sh_ensures_oicc_bridge_before_master_launch() -> None:
+    start_sh = Path(__file__).resolve().parents[1] / "start.sh"
+    text = start_sh.read_text(encoding="utf-8")
+
+    bridge_index = text.index("scripts.oicc_bridge start")
+    launch_index = text.index('echo "[start.sh] launching master..."')
+
+    assert bridge_index < launch_index
 
 
 @pytest.mark.asyncio

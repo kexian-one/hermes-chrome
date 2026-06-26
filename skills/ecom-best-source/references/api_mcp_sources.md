@@ -1,6 +1,12 @@
 # API/MCP 数据源路由
 
-## 优先级
+## JD/B2B 商品页来源
+
+京东商品页不是 API-only 路径。需要 JD/B2B 价格、已选 SKU、品牌或起购倍数时，优先使用当前 worker 的浏览器 MCP/OICC 登录态页面读取 `title`、`image_urls`、`item_id`、`selected_sku`、`brand`、`price`/`jd_price`、`buy_multiple`。`scripts/jd_product.py` 只在浏览器字段缺失时补静态 HTML 可得的 `title`、`item_id`、`main_image_url`、`image_urls`。
+
+每个 worker 由 `agent.worker` 按自己的 `mcp_port` 连接 OICC。skill 内不要手动指定端口，也不要复用其他 worker 的 tab 或浏览器实例。
+
+## 1688 优先级
 
 1. Alphashop/1688 MCP
    - 文搜: `keywordSearchProduct`
@@ -36,6 +42,7 @@ ecom_best_source:
 ## 可执行脚本
 
 - `scripts/ecom_config.py --status`: 检查数据源配置，脱敏输出。
+- `scripts/jd_product.py --url ...`: 仅作为 JD/B2B 浏览器结果的静态补缺脚本。
 - `scripts/keyword_builder.py --title ...`: 从 JD 标题构造 target、query、extra_queries。
 - `scripts/fetch_candidates.py --query ... [--image-url ...]`: 真实调用 Onebound / Alphashop MCP / hybrid，输出归一化候选。
 - `scripts/sourcing_rules.py --input candidates.json`: 对候选应用最终筛选规则。

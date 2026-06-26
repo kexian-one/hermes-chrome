@@ -1,4 +1,4 @@
-"""Tests for idle watchdog, slider escalation, zombie cleanup, and health check."""
+"""Tests for idle watchdog, slider escalation, bridge helpers, and health check."""
 
 from __future__ import annotations
 
@@ -246,12 +246,12 @@ async def test_slider_watchdog_cooldown_deduplication(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Task #9 — zombie cleanup
+# Task #9 — bridge helper parsing
 # ---------------------------------------------------------------------------
 
 
-def test_kill_zombie_returns_empty_when_no_ports(monkeypatch):
-    """When no processes listen on oicc ports, nothing is killed."""
+def test_kill_zombie_returns_empty_when_no_ports():
+    """When no processes listen on oicc ports, legacy cleanup is a no-op."""
     from agent.zombies import kill_zombie_oicc_processes
 
     with patch("agent.zombies._find_pids_on_ports", return_value={}):
@@ -262,7 +262,7 @@ def test_kill_zombie_returns_empty_when_no_ports(monkeypatch):
 
 def test_kill_zombie_skips_non_oicc_process():
     """Processes with no oicc marker in cmdline are not killed."""
-    from agent.zombies import kill_zombie_oicc_processes, _ZombieInfo
+    from agent.zombies import kill_zombie_oicc_processes
 
     killed_pids: list[int] = []
 
@@ -280,54 +280,7 @@ def test_kill_zombie_skips_non_oicc_process():
     assert killed_pids == []
 
 
-def test_kill_zombie_kills_oicc_process():
-    """Processes with oicc marker in cmdline ARE killed."""
-    from agent.zombies import kill_zombie_oicc_processes
-
-    killed_pids: list[int] = []
-
-    def fake_kill(pid: int) -> None:
-        killed_pids.append(pid)
-
-    oicc_cmd = r"node.exe C:\project\deploy\oicc-b2\host\mcp-server.js"
-
-    with (
-        patch("agent.zombies._find_pids_on_ports", return_value={18766: 6001}),
-        patch("agent.zombies._get_process_cmdline", return_value=oicc_cmd),
-        patch("agent.zombies._kill_pid", side_effect=fake_kill),
-    ):
-        killed = kill_zombie_oicc_processes()
-
-    assert len(killed) == 1
-    assert killed[0].pid == 6001
-    assert killed[0].port == 18766
-    assert 6001 in killed_pids
-
-
-def test_kill_zombie_kills_multiple_ports():
-    """Multiple oicc processes across different ports are all killed."""
-    from agent.zombies import kill_zombie_oicc_processes
-
-    killed_pids: list[int] = []
-
-    def fake_kill(pid: int) -> None:
-        killed_pids.append(pid)
-
-    ports = {18765: 7001, 18767: 7003}
-    cmd = r"node.exe C:\ai\all-in-ai\deploy\oicc-b1\host\mcp-server.js"
-
-    with (
-        patch("agent.zombies._find_pids_on_ports", return_value=ports),
-        patch("agent.zombies._get_process_cmdline", return_value=cmd),
-        patch("agent.zombies._kill_pid", side_effect=fake_kill),
-    ):
-        killed = kill_zombie_oicc_processes()
-
-    assert len(killed) == 2
-    assert set(killed_pids) == {7001, 7003}
-
-
-def test_zombie_posix_lsof_parser():
+def test_oicc_port_posix_lsof_parser():
     from agent.zombies import _find_pids_on_ports
 
     lsof = """COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
@@ -340,12 +293,6 @@ node    9999 user   26u  IPv4 0xaaa      0t0  TCP 127.0.0.1:9999 (LISTEN)
         patch("agent.zombies.subprocess.run", return_value=MagicMock(returncode=0, stdout=lsof)),
     ):
         assert _find_pids_on_ports() == {18765: 1234, 18770: 5678}
-
-
-def test_zombie_marker_accepts_posix_paths():
-    from agent.zombies import _is_oicc_cmdline
-
-    assert _is_oicc_cmdline("node /Users/me/all-in-ai/deploy/oicc-b2/host/mcp-server.js")
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +338,22 @@ async def test_health_check_partial_failure(tmp_path: Path, capsys):
     captured = capsys.readouterr()
     assert "b2=✗" in captured.out
     assert "b1=✓" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_health_probe_requires_existing_oicc_bridge(tmp_path: Path):
+    from agent.health import _probe_one
+
+    wc = _make_wc(tmp_path, "b1")
+    mock_mcp = MagicMock()
+    mock_mcp.__aenter__ = AsyncMock(side_effect=OSError("bridge down"))
+
+    with patch("agent.health.OpenClaudeInChromeClient", return_value=mock_mcp) as mcp_cls:
+        result = await _probe_one(wc)
+
+    assert result.healthy is False
+    assert "OSError" in result.reason
+    assert mcp_cls.call_args.kwargs["require_bridge"] is True
 
 
 @pytest.mark.asyncio

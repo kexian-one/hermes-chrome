@@ -549,6 +549,29 @@ def test_jd_product_b2b_generic_falls_back_to_item_page(monkeypatch) -> None:
     assert result["main_image_url"] == "https://img10.360buyimg.com/n1/s720x720_jfs/t1/product.jpg"
 
 
+def test_jd_browser_strategy_documents_static_fallback_only_for_missing_fields() -> None:
+    root = Path(__file__).parent.parent
+    skill = (root / "skills" / "ecom-best-source" / "SKILL.md").read_text(encoding="utf-8")
+    reference = (
+        root
+        / "skills"
+        / "ecom-best-source"
+        / "references"
+        / "jd_browser_product_source.md"
+    ).read_text(encoding="utf-8")
+
+    for field in ("title", "image_urls", "item_id", "selected_sku", "brand", "price", "jd_price", "buy_multiple"):
+        assert field in skill
+        assert field in reference
+    assert "requires_browser_mcp: true" in skill
+    assert "MCP 不通" in skill
+    assert "静态补齐" in skill
+    assert "继续后续召回" in skill
+    assert "只填空字段" in skill
+    assert "不手动指定端口" in reference
+    assert "不覆盖浏览器登录态字段" in reference
+
+
 def test_data_source_jwt_hs256_shape() -> None:
     mod = _load_data_sources_module()
 
@@ -570,7 +593,8 @@ def test_sourcing_pipeline_writes_final_csv_with_bom(tmp_path: Path) -> None:
   "title": "红鸟 RED BIRD 黑色液体鞋油 75g",
   "jd_url": "https://item.jd.com/100012345678.html",
   "item_id": "100012345678",
-  "main_image_url": "https://img.example/jd.jpg"
+  "main_image_url": "https://img.example/jd.jpg",
+  "price": 5
 }
 """,
         encoding="utf-8",
@@ -623,6 +647,8 @@ def test_sourcing_pipeline_writes_final_csv_with_bom(tmp_path: Path) -> None:
     assert headers == [
         "1688商品标题",
         "价格(元)",
+        "总进货价(元)",
+        "利润率",
         "邮费",
         "起批数",
         "规格匹配",
@@ -640,6 +666,7 @@ def test_sourcing_pipeline_writes_final_csv_with_bom(tmp_path: Path) -> None:
     assert "https://detail.1688.com/offer/1001.html" in text
     assert "SKU库存" in text
     rows = list(csv.reader(output.open(encoding="utf-8-sig")))
+    assert rows[1][1:4] == ["3.2", "9.6", "36.00%"]
     assert rows[8][1] == "https://detail.1688.com/offer/1001.html，义乌红鸟日化"
 
 

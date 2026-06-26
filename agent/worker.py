@@ -8,7 +8,14 @@ import os
 import sys
 from pathlib import Path
 
-from agent.builtin_tools import BUILTIN_TOOLS, execute_builtin, is_builtin
+from agent.builtin_tools import (
+    BROWSER_BUILTIN_TOOLS,
+    BUILTIN_TOOLS,
+    execute_browser_builtin,
+    execute_builtin,
+    is_browser_builtin,
+    is_builtin,
+)
 from agent.config import WorkerConfig, worker_config_from_file
 from agent.llm_client import LLMClient
 from agent.mcp_client import OpenClaudeInChromeClient, tools_to_openai_functions
@@ -262,6 +269,20 @@ async def _run_chat_loop(
                         knowledge_root=_resolve_knowledge_root(),
                     )
                     is_error = False
+                elif is_browser_builtin(tc.name):
+                    if mcp is None:
+                        result_text = (
+                            f"error: tool {tc.name!r} is unavailable because this skill "
+                            "does not enable browser MCP"
+                        )
+                        is_error = True
+                    else:
+                        proj_root_env = os.environ.get("WORKER_PROJECT_ROOT", "").strip()
+                        proj_root = Path(proj_root_env) if proj_root_env else Path.cwd()
+                        result_text = await execute_browser_builtin(
+                            tc.name, tc.arguments, proj_root, mcp=mcp,
+                        )
+                        is_error = False
                 elif mcp is None:
                     result_text = (
                         f"error: tool {tc.name!r} is unavailable because this skill "
@@ -303,8 +324,17 @@ async def _run_chat_loop(
                 else:
                     productive_calls += 1
 
-                if "extension is not connected" in result_text.lower() or \
-                   "extension not connected" in result_text.lower():
+                browser_builtin_soft_fail = (
+                    label == "ecom-best-source"
+                    and tc.name == "extract_jd_product_browser"
+                )
+                if (
+                    not browser_builtin_soft_fail
+                    and (
+                        "extension is not connected" in result_text.lower()
+                        or "extension not connected" in result_text.lower()
+                    )
+                ):
                     extension_disconnected = True
 
         elif response.finish_reason == "stop":
@@ -417,12 +447,13 @@ async def run(
         async with OpenClaudeInChromeClient(
             port=config.mcp_port,
             mcp_server_js_path=config.mcp_server_js_path,
+            require_bridge=True,
         ) as mcp:
             tools = await mcp.list_tools()
-            openai_tools = tools_to_openai_functions(tools) + BUILTIN_TOOLS
+            openai_tools = tools_to_openai_functions(tools) + BUILTIN_TOOLS + BROWSER_BUILTIN_TOOLS
             log.info(
-                "worker=%s label=%s mcp_tools=%d builtin_tools=%d",
-                config.worker_id, label, len(tools), len(BUILTIN_TOOLS),
+                "worker=%s label=%s mcp_tools=%d builtin_tools=%d browser_builtin_tools=%d",
+                config.worker_id, label, len(tools), len(BUILTIN_TOOLS), len(BROWSER_BUILTIN_TOOLS),
             )
             return await _run_chat_loop(
                 config, system_prompt, label, user_task, openai_tools,

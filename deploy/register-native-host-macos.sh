@@ -59,13 +59,18 @@ launcher="${script_dir}/oicc-b${instance}.sh"
 browser_key="$(printf '%s' "$browser" | tr '[:upper:]' '[:lower:]')"
 case "$browser_key" in
   chrome) browser_dir="${HOME}/Library/Application Support/Google/Chrome/NativeMessagingHosts" ;;
+  chrome-beta|chromebeta) browser_dir="${HOME}/Library/Application Support/Google/Chrome Beta/NativeMessagingHosts" ;;
+  chrome-canary|chromecanary) browser_dir="${HOME}/Library/Application Support/Google/Chrome Canary/NativeMessagingHosts" ;;
   edge) browser_dir="${HOME}/Library/Application Support/Microsoft Edge/NativeMessagingHosts" ;;
+  edge-beta|edgebeta) browser_dir="${HOME}/Library/Application Support/Microsoft Edge Beta/NativeMessagingHosts" ;;
+  edge-canary|edgecanary) browser_dir="${HOME}/Library/Application Support/Microsoft Edge Canary/NativeMessagingHosts" ;;
+  edge-dev|edgedev) browser_dir="${HOME}/Library/Application Support/Microsoft Edge Dev/NativeMessagingHosts" ;;
   brave) browser_dir="${HOME}/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts" ;;
   vivaldi) browser_dir="${HOME}/Library/Application Support/Vivaldi/NativeMessagingHosts" ;;
   opera) browser_dir="${HOME}/Library/Application Support/com.operasoftware.Opera/NativeMessagingHosts" ;;
   chromium) browser_dir="${HOME}/Library/Application Support/Chromium/NativeMessagingHosts" ;;
   *)
-    echo "unsupported browser: $browser (Chrome/Edge/Brave/Vivaldi/Opera/Chromium)" >&2
+    echo "unsupported browser: $browser (Chrome/Chrome-Beta/Chrome-Canary/Edge/Edge-Beta/Edge-Canary/Edge-Dev/Brave/Vivaldi/Opera/Chromium)" >&2
     exit 2
     ;;
 esac

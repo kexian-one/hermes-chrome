@@ -360,3 +360,262 @@ async def test_mcp_connect_failure_returns_2(skills_dir: Path) -> None:
         exit_code = await run(config, "test prompt", "fapiao-1688")
 
     assert exit_code == 2
+
+
+@pytest.mark.asyncio
+async def test_ecom_browser_mcp_uses_configured_worker_port(tmp_path: Path) -> None:
+    config = WorkerConfig(
+        worker_id="b3",
+        mcp_port=18767,
+        skills_dir=tmp_path,
+        llm_multimodal=_DUMMY_LLM,
+        llm_reasoning=_DUMMY_LLM,
+        log_dir=Path("/tmp"),
+    )
+    mock_llm = AsyncMock()
+    mock_llm.chat = AsyncMock(return_value=ChatResponse(
+        text="任务完成",
+        tool_calls=[],
+        finish_reason="stop",
+    ))
+    mock_mcp = AsyncMock()
+    mock_mcp.__aenter__ = AsyncMock(return_value=mock_mcp)
+    mock_mcp.__aexit__ = AsyncMock(return_value=False)
+    mock_mcp.list_tools = AsyncMock(return_value=[])
+
+    with (
+        patch("agent.worker.LLMClient", return_value=mock_llm),
+        patch("agent.worker.OpenClaudeInChromeClient", return_value=mock_mcp) as mcp_cls,
+    ):
+        exit_code = await run(
+            config,
+            "test prompt",
+            "ecom-best-source",
+            requires_browser_mcp=True,
+        )
+
+    assert exit_code == 0
+    mcp_cls.assert_called_once()
+    assert mcp_cls.call_args.kwargs["port"] == 18767
+    assert mcp_cls.call_args.kwargs["require_bridge"] is True
+
+
+@pytest.mark.asyncio
+async def test_browser_builtin_tool_is_available_when_browser_mcp_enabled(tmp_path: Path) -> None:
+    config = WorkerConfig(
+        worker_id="b1",
+        mcp_port=18765,
+        skills_dir=tmp_path,
+        llm_multimodal=_DUMMY_LLM,
+        llm_reasoning=_DUMMY_LLM,
+        log_dir=Path("/tmp"),
+    )
+    captured_tools: list[dict] = []
+
+    async def fake_chat(messages, tools=None):
+        nonlocal captured_tools
+        captured_tools = tools or []
+        return ChatResponse(text="任务完成", tool_calls=[], finish_reason="stop")
+
+    mock_llm = AsyncMock()
+    mock_llm.chat = AsyncMock(side_effect=fake_chat)
+    mock_mcp = AsyncMock()
+    mock_mcp.__aenter__ = AsyncMock(return_value=mock_mcp)
+    mock_mcp.__aexit__ = AsyncMock(return_value=False)
+    mock_mcp.list_tools = AsyncMock(return_value=[])
+
+    with (
+        patch("agent.worker.LLMClient", return_value=mock_llm),
+        patch("agent.worker.OpenClaudeInChromeClient", return_value=mock_mcp),
+    ):
+        exit_code = await run(
+            config,
+            "test prompt",
+            "non-ecom-browser-skill",
+            requires_browser_mcp=True,
+        )
+
+    assert exit_code == 0
+    tool_names = {tool["function"]["name"] for tool in captured_tools}
+    assert "extract_jd_product_browser" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_browser_builtin_tool_uses_current_mcp_and_writes_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "outputs" / "b1-test"
+    output_dir.mkdir(parents=True)
+    monkeypatch.setenv("WORKER_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setenv("WORKER_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setenv("WORKER_SKILL_NAME", "ecom-best-source")
+
+    config = WorkerConfig(
+        worker_id="b1",
+        mcp_port=18765,
+        skills_dir=tmp_path,
+        llm_multimodal=_DUMMY_LLM,
+        llm_reasoning=_DUMMY_LLM,
+        log_dir=Path("/tmp"),
+    )
+    responses = iter([
+        ChatResponse(
+            text=None,
+            tool_calls=[ToolCall(
+                id="call_1",
+                name="extract_jd_product_browser",
+                arguments=json.dumps({
+                    "url": "https://b2b.jd.com/goods/goods-detail/10212040410264",
+                    "output": "jd_product.json",
+                    "wait_seconds": 3,
+                }),
+            )],
+            finish_reason="tool_calls",
+        ),
+        ChatResponse(text="任务完成", tool_calls=[], finish_reason="stop"),
+        ChatResponse(text="任务完成", tool_calls=[], finish_reason="stop"),
+        ChatResponse(text="任务完成", tool_calls=[], finish_reason="stop"),
+    ])
+    mock_llm = AsyncMock()
+    mock_llm.chat = AsyncMock(side_effect=lambda *a, **kw: next(responses))
+
+    mock_mcp = AsyncMock()
+    mock_mcp.__aenter__ = AsyncMock(return_value=mock_mcp)
+    mock_mcp.__aexit__ = AsyncMock(return_value=False)
+    mock_mcp.list_tools = AsyncMock(return_value=[])
+
+    async def fake_call_tool(name, args):
+        if name == "tabs_context_mcp":
+            return ToolResult(
+                content=[{"type": "text", "text": '{"availableTabs":[{"tabId":42}]}'}],
+                is_error=False,
+            )
+        if name == "tabs_create_mcp":
+            return ToolResult(
+                content=[{"type": "text", "text": 'Created new tab. Tab ID: 43\n\n{"availableTabs":[{"tabId":42},{"tabId":43}]}'}],
+                is_error=False,
+            )
+        if name == "navigate":
+            return ToolResult(content=[{"type": "text", "text": "Navigated"}], is_error=False)
+        if name == "javascript_tool":
+            return ToolResult(
+                content=[{
+                    "type": "text",
+                    "text": json.dumps(json.dumps({
+                        "title": "香丹青咸鸭蛋礼盒",
+                        "jd_url": "https://b2b.jd.com/goods/goods-detail/10212040410264",
+                        "item_id": "10212040410264",
+                        "price": 28.8,
+                        "jd_price": 28.8,
+                        "price_text": "采购价 ￥28.8",
+                        "main_image_url": "https://m.360buyimg.com/n1/jfs/test.jpg",
+                        "image_urls": ["https://m.360buyimg.com/n1/jfs/test.jpg"],
+                    }, ensure_ascii=False), ensure_ascii=False),
+                }],
+                is_error=False,
+            )
+        if name == "tabs_close_mcp":
+            return ToolResult(content=[{"type": "text", "text": f"Closed tab {args['tabId']}."}], is_error=False)
+        return ToolResult(content=[{"type": "text", "text": ""}], is_error=False)
+
+    mock_mcp.call_tool = AsyncMock(side_effect=fake_call_tool)
+
+    with (
+        patch("agent.worker.LLMClient", return_value=mock_llm),
+        patch("agent.worker.OpenClaudeInChromeClient", return_value=mock_mcp),
+        patch("agent.builtin_tools.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        exit_code = await run(
+            config,
+            "test prompt",
+            "ecom-best-source",
+            requires_browser_mcp=True,
+        )
+
+    assert exit_code == 1
+    product_path = output_dir / ".ecom-scratch" / "jd_product.json"
+    assert product_path.is_file()
+    product = json.loads(product_path.read_text(encoding="utf-8"))
+    assert product["item_id"] == "10212040410264"
+    assert product["price"] == 28.8
+    calls = [(call.args[0], call.args[1]) for call in mock_mcp.call_tool.call_args_list]
+    assert ("tabs_create_mcp", {}) in calls
+    navigate = next(args for name, args in calls if name == "navigate")
+    assert navigate["tabId"] == 43
+    assert navigate["url"] == (
+        "https://b2b.jd.com/goods/goods-detail/10212040410264"
+        "?sourceurl=/trade/goods-detail&bMallTag=1&buId=456"
+    )
+    assert ("tabs_close_mcp", {"tabId": 43}) in calls
+
+
+@pytest.mark.asyncio
+async def test_ecom_browser_extract_failure_can_fallback_to_csv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "outputs" / "b1-test"
+    output_dir.mkdir(parents=True)
+    monkeypatch.setenv("WORKER_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setenv("WORKER_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setenv("WORKER_SKILL_NAME", "ecom-best-source")
+
+    config = WorkerConfig(
+        worker_id="b1",
+        mcp_port=18765,
+        skills_dir=tmp_path,
+        llm_multimodal=_DUMMY_LLM,
+        llm_reasoning=_DUMMY_LLM,
+        log_dir=Path("/tmp"),
+    )
+    responses = iter([
+        ChatResponse(
+            text=None,
+            tool_calls=[ToolCall(
+                id="call_1",
+                name="extract_jd_product_browser",
+                arguments=json.dumps({"url": "https://item.jd.com/10177709350354.html"}),
+            )],
+            finish_reason="tool_calls",
+        ),
+        ChatResponse(
+            text=None,
+            tool_calls=[ToolCall(
+                id="call_2",
+                name="write_file",
+                arguments=json.dumps({
+                    "path": "找货_兜底_20260626.csv",
+                    "content": "\ufeff1688商品标题,价格(元)\n测试,1\n",
+                }),
+            )],
+            finish_reason="tool_calls",
+        ),
+        ChatResponse(text="完成", tool_calls=[], finish_reason="stop"),
+    ])
+    mock_llm = AsyncMock()
+    mock_llm.chat = AsyncMock(side_effect=lambda *a, **kw: next(responses))
+    mock_mcp = AsyncMock()
+    mock_mcp.__aenter__ = AsyncMock(return_value=mock_mcp)
+    mock_mcp.__aexit__ = AsyncMock(return_value=False)
+    mock_mcp.list_tools = AsyncMock(return_value=[])
+
+    with (
+        patch("agent.worker.LLMClient", return_value=mock_llm),
+        patch("agent.worker.OpenClaudeInChromeClient", return_value=mock_mcp),
+        patch(
+            "agent.worker.execute_browser_builtin",
+            new=AsyncMock(return_value=json.dumps({
+                "ok": False,
+                "error": "browser extension is not connected",
+                "fallback_required": "run jd_product.py",
+            })),
+        ),
+    ):
+        exit_code = await run(
+            config,
+            "test prompt",
+            "ecom-best-source",
+            requires_browser_mcp=True,
+        )
+
+    assert exit_code == 0
+    assert (output_dir / "找货_兜底_20260626.csv").is_file()

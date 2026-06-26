@@ -23,7 +23,12 @@ from pathlib import Path
 
 PROCESS_NAME_BY_BROWSER: dict[str, str] = {
     "chrome": "chrome",
+    "chrome-beta": "chrome",
+    "chrome-canary": "chrome",
     "edge": "msedge",
+    "edge-beta": "msedge",
+    "edge-canary": "msedge",
+    "edge-dev": "msedge",
     "brave": "brave",
     "vivaldi": "vivaldi",
     "opera": "opera",
@@ -32,7 +37,12 @@ PROCESS_NAME_BY_BROWSER: dict[str, str] = {
 
 MAC_APP_BY_BROWSER: dict[str, str] = {
     "chrome": "Google Chrome",
+    "chrome-beta": "Google Chrome Beta",
+    "chrome-canary": "Google Chrome Canary",
     "edge": "Microsoft Edge",
+    "edge-beta": "Microsoft Edge Beta",
+    "edge-canary": "Microsoft Edge Canary",
+    "edge-dev": "Microsoft Edge Dev",
     "brave": "Brave Browser",
     "vivaldi": "Vivaldi",
     "opera": "Opera",
