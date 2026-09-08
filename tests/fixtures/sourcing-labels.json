@@ -1,0 +1,28 @@
+{
+  "description": "Synthetic offline regression examples, not real SKU accuracy evidence",
+  "cases": [
+    {
+      "id": "same-brand-select-exact-flavor",
+      "target": {"title": "样例牌草莓饼干100g×6袋", "brand": "样例牌", "category": "饼干", "buy_multiple": 3},
+      "candidates": [
+        {"num_iid": "1001", "title": "样例牌饼干", "shopName": "模拟供应商", "compositeScore": 5, "shopYear": 5,
+          "detail": {"skus": {"sku": [
+            {"sku_id": "wrong-cheap", "properties_name": "巧克力100g×6袋", "price": 1, "quantity": 100},
+            {"sku_id": "correct", "properties_name": "草莓100g×6袋", "price": 12, "quantity": 100}
+          ]}}
+        }
+      ],
+      "expected_matches": [{"offer_id": "1001", "sku_id": "correct"}]
+    },
+    {
+      "id": "same-brand-wrong-pack-count",
+      "target": {"title": "样例牌草莓饼干100g×6袋", "brand": "样例牌", "category": "饼干", "buy_multiple": 3},
+      "candidates": [
+        {"num_iid": "1002", "title": "样例牌饼干", "detail": {"skus": {"sku": [
+          {"sku_id": "wrong-count", "properties_name": "草莓100g×3袋", "price": 5, "quantity": 100}
+        ]}}}
+      ],
+      "expected_matches": []
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # all-in-ai
 
-1688 invoice automation worker agent runtime.
+1688 sourcing and invoice automation worker runtime. See [找货优化与验收说明](OPTIMIZATION.md) for SKU matching, product vision and validation.
 
 ## Requirements
 
@@ -10,10 +10,12 @@
 
 ## Install
 
+Windows: run `.\setup.ps1` to install the locked environment.
+
 Recommended on macOS:
 
 ```bash
-uv sync --extra dev
+uv sync --frozen --extra dev
 ```
 
 Or with an existing Python 3.11+ environment:
@@ -31,12 +33,12 @@ cp config.example.yaml config.yaml     # macOS/Linux
 # or: copy config.example.yaml config.yaml   # PowerShell
 ```
 
-Then fill in your keys. The system uses **two distinct LLM models**:
+Then fill in your keys. The system uses **two independently configured LLM roles**:
 
 | Role | Used for | Default |
 | --- | --- | --- |
-| `llm.multimodal` | Anything that needs vision (screenshots, slider images, 飞书 image attachments) | `qwen3-vl-max` |
-| `llm.reasoning` | Pure text / tool-calling agentic loop (worker default for fapiao skills) | `qwen3.6-plus` |
+| `llm.multimodal` | Anything that needs vision (screenshots, slider images, 飞书 image attachments) | `qwen3.8-flash` |
+| `llm.reasoning` | Pure text / tool-calling agentic loop (worker default for fapiao skills) | `qwen3.8-flash` |
 
 Same key, same `base_url`, different `model` strings is fine — both default to Alibaba DashScope's OpenAI-compatible endpoint.
 

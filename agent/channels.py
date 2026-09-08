@@ -75,8 +75,8 @@ class ReplyTarget:
         if not file_path.is_file():
             return False
         try:
-            await self.channel.send_file(self.target_id, str(file_path))
-            return True
+            receipt = await self.channel.send_file(self.target_id, str(file_path))
+            return receipt is not False
         except Exception as exc:
             print(f"[reply-target] send_file({file_path.name}) failed: {exc}", flush=True)
             return False

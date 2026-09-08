@@ -139,6 +139,40 @@ class _MasterDispatcherImpl:
         # Edge processes and confusing the bridge.
         self._restarting_browser: set[str] = set()
         self._inflight: set[asyncio.Task] = set()
+        self._worker_tasks: dict[str, asyncio.Task] = {}
+        self._queue_path = config.project_root / "state" / "dispatch.json" if getattr(tracker, "_path", None) else None
+        self._restored_queue: list[dict] = []
+        if self._queue_path and self._queue_path.is_file():
+            import json
+            state = json.loads(self._queue_path.read_text(encoding="utf-8"))
+            self._restored_queue = state.get("queued") or []
+            self._paused[0] = bool(state.get("paused", False))
+
+    def _persist_queues(self) -> None:
+        if not self._queue_path:
+            return
+        from agent.ecom_modules import load_scripts
+        load_scripts()
+        from runtime_support import atomic_json
+        rows = list(self._restored_queue)
+        for item in [*self._global_queue, *(item for queue in self._worker_queues.values() for item in queue)]:
+            reply = item.reply_to
+            rows.append({"skill": item.skill, "task": item.task, "requested_worker_id": item.requested_worker_id, "explicit_worker": item.explicit_worker, "created_at": item.created_at.isoformat(), "app_id": str(getattr(reply.channel, "app_id", "")) if reply else "", "chat_id": reply.target_id if reply else ""})
+        atomic_json(self._queue_path, {"paused": self._paused[0], "queued": rows})
+
+    def _restore_queues(self) -> None:
+        unresolved = []
+        for row in self._restored_queue:
+            reply = self.find_reply_target_by_app_id(row.get("app_id", ""), row.get("chat_id", ""))
+            if row.get("chat_id") and reply is None:
+                unresolved.append(row)
+                continue
+            item = _QueuedDispatch(skill=row["skill"], task=row.get("task", ""), reply_to=reply, requested_worker_id=row.get("requested_worker_id"), explicit_worker=bool(row.get("explicit_worker")), created_at=datetime.fromisoformat(row["created_at"]))
+            queue = self._worker_queue(item.requested_worker_id) if item.requested_worker_id else self._global_queue
+            queue.append(item)
+        self._restored_queue = unresolved
+        self._persist_queues()
+        self._schedule_drain()
 
     def register_channel(
         self, channel: Any, alert_chat_id: str, supports_files: bool = False,
@@ -148,6 +182,8 @@ class _MasterDispatcherImpl:
         channel flagged `is_alert_target=true` (or, if none flagged, the first
         registered channel)."""
         self._channels.append((channel, alert_chat_id, supports_files, machine_name, is_alert_target))
+        if self._restored_queue:
+            self._restore_queues()
 
     def find_reply_target_by_app_id(
         self, app_id: str, chat_id: str,
@@ -227,18 +263,18 @@ class _MasterDispatcherImpl:
     def _release_worker(self, worker_id: str) -> None:
         self._pending.discard(worker_id)
 
-    def _is_worker_idle(self, worker_id: str) -> bool:
+    def _is_worker_idle(self, worker_id: str, allow_unhealthy: bool = False) -> bool:
         return (
-            worker_id not in self._unhealthy
+            (allow_unhealthy or worker_id not in self._unhealthy)
             and worker_id not in self._pending
             and not self._is_alive(worker_id)
             and self._worker_config(worker_id) is not None
         )
 
-    def _idle_auto_workers(self) -> list[str]:
+    def _idle_auto_workers(self, allow_unhealthy: bool = False) -> list[str]:
         return [
             worker_id for worker_id in AUTO_WORKER_IDS
-            if self._is_worker_idle(worker_id)
+            if self._is_worker_idle(worker_id, allow_unhealthy)
         ]
 
     def _worker_queue(self, worker_id: str) -> deque[_QueuedDispatch]:
@@ -261,6 +297,7 @@ class _MasterDispatcherImpl:
             requested_worker_id=worker_id,
             explicit_worker=True,
         ))
+        self._persist_queues()
         return DispatchResult(
             status="queued",
             worker_id=worker_id,
@@ -285,6 +322,7 @@ class _MasterDispatcherImpl:
             requested_worker_id=None,
             explicit_worker=False,
         ))
+        self._persist_queues()
         return DispatchResult(
             status="queued",
             worker_id=None,
@@ -315,7 +353,7 @@ class _MasterDispatcherImpl:
                 reason="unknown_worker",
                 explicit_worker=explicit_worker,
             )
-        if worker_id in self._unhealthy:
+        if worker_id in self._unhealthy and skill != "ecom-best-source":
             print(f"[health] {worker_id} is unhealthy, skipping spawn_now")
             return DispatchResult(
                 status="rejected",
@@ -337,6 +375,7 @@ class _MasterDispatcherImpl:
         ts = _timestamp()
         log_path = self.log_dir / f"worker-{worker_id}-{ts}.log"
         resolved_reply = self._resolve_reply_to(reply_to)
+        self.worker_state.remember_task(worker_id, task)
         spawn_task = asyncio.create_task(
             spawn_one_skill(
                 wc, skill, log_path, tracker=self.worker_state,
@@ -347,6 +386,7 @@ class _MasterDispatcherImpl:
             )
         )
         self._inflight.add(spawn_task)
+        self._worker_tasks[worker_id] = spawn_task
         spawn_task.add_done_callback(
             lambda t, wid=worker_id, rt=resolved_reply: self._on_spawn_done(t, wid, rt)
         )
@@ -374,9 +414,11 @@ class _MasterDispatcherImpl:
 
     async def _drain_queues(self, preferred_worker_id: str | None = None) -> None:
         async with self._drain_lock:
+            if self._paused[0]:
+                return
             if preferred_worker_id:
                 queue = self._worker_queue(preferred_worker_id)
-                if queue and self._is_worker_idle(preferred_worker_id):
+                if queue and self._is_worker_idle(preferred_worker_id, queue[0].skill == "ecom-best-source"):
                     item = queue.popleft()
                     result = self._start_spawn(
                         preferred_worker_id,
@@ -396,7 +438,7 @@ class _MasterDispatcherImpl:
                 if worker_id == preferred_worker_id:
                     continue
                 queue = self._worker_queue(worker_id)
-                if not queue or not self._is_worker_idle(worker_id):
+                if not queue or not self._is_worker_idle(worker_id, queue[0].skill == "ecom-best-source"):
                     continue
                 item = queue.popleft()
                 result = self._start_spawn(
@@ -411,7 +453,7 @@ class _MasterDispatcherImpl:
                     queue.appendleft(item)
 
             while self._global_queue:
-                idle_workers = self._idle_auto_workers()
+                idle_workers = self._idle_auto_workers(self._global_queue[0].skill == "ecom-best-source")
                 if not idle_workers:
                     break
                 worker_id = idle_workers[0]
@@ -427,6 +469,7 @@ class _MasterDispatcherImpl:
                 if result.status != "started":
                     self._global_queue.appendleft(item)
                     break
+            self._persist_queues()
 
     def _on_spawn_done(
         self, task: asyncio.Task, worker_id: str, reply_to: ReplyTarget | None,
@@ -440,6 +483,8 @@ class _MasterDispatcherImpl:
         - Anything else → no callback action.
         """
         self._inflight.discard(task)
+        if self._worker_tasks.get(worker_id) is task:
+            self._worker_tasks.pop(worker_id, None)
         self._release_worker(worker_id)
         if task.cancelled():
             self._schedule_drain(worker_id)
@@ -527,7 +572,7 @@ class _MasterDispatcherImpl:
         # Quick connectivity check — if extension is down, restart_worker
         # is futile. Reroute to browser restart so user clicks ONE button
         # and the system figures out the right fix.
-        connected = await self.probe_extension_connectivity(worker_id)
+        connected = last_skill == "ecom-best-source" or await self.probe_extension_connectivity(worker_id)
         if not connected:
             if reply_to and reply_to.is_valid:
                 await reply_to.send_card(info_card(
@@ -542,6 +587,7 @@ class _MasterDispatcherImpl:
         # if any (was set at startup but now extension is back).
         self._unhealthy.discard(worker_id)
 
+        saved_task = next((s.last_task for s in self.worker_state.snapshot() if s.worker_id == worker_id), "")
         if not self._reserve_worker(worker_id, last_skill):
             print(f"[dispatch] {worker_id} already alive or pending, restart_worker skipped")
             return
@@ -551,12 +597,14 @@ class _MasterDispatcherImpl:
         task = asyncio.create_task(
             spawn_one_skill(
                 wc, last_skill, log_path, tracker=self.worker_state,
+                task=saved_task,
                 reply_to=resolved_reply,
                 machine_name=self._machine_name_for(resolved_reply),
                 project_root=self._config.project_root,
             )
         )
         self._inflight.add(task)
+        self._worker_tasks[worker_id] = task
         task.add_done_callback(
             lambda t, wid=worker_id, rt=resolved_reply: self._on_spawn_done(t, wid, rt)
         )
@@ -579,6 +627,10 @@ class _MasterDispatcherImpl:
         """
         requested_worker = str(worker_id or "").strip().lower()
         explicit_worker = requested_worker not in {"", "auto", "*"}
+        if self._paused[0]:
+            if explicit_worker and self._worker_config(requested_worker) is None:
+                return DispatchResult(status="rejected", worker_id=requested_worker, skill=skill, task=task, reason="unknown_worker", explicit_worker=True)
+            return self._queue_for_worker(requested_worker, skill, reply_to, task) if explicit_worker else self._queue_global(skill, reply_to, task)
         if explicit_worker:
             if self._worker_config(requested_worker) is None:
                 return DispatchResult(
@@ -589,7 +641,7 @@ class _MasterDispatcherImpl:
                     reason="unknown_worker",
                     explicit_worker=True,
                 )
-            if requested_worker in self._unhealthy:
+            if requested_worker in self._unhealthy and skill != "ecom-best-source":
                 print(f"[health] {requested_worker} is unhealthy, skipping spawn_now")
                 return DispatchResult(
                     status="rejected",
@@ -603,7 +655,7 @@ class _MasterDispatcherImpl:
                 result = self._queue_for_worker(requested_worker, skill, reply_to, task)
                 self._schedule_drain(requested_worker)
                 return result
-            if self._is_worker_idle(requested_worker):
+            if self._is_worker_idle(requested_worker, skill == "ecom-best-source"):
                 return self._start_spawn(
                     requested_worker, skill, reply_to, task=task, explicit_worker=True
                 )
@@ -618,7 +670,7 @@ class _MasterDispatcherImpl:
             self._schedule_drain()
             return result
 
-        idle_workers = self._idle_auto_workers()
+        idle_workers = self._idle_auto_workers(skill == "ecom-best-source")
         if idle_workers:
             return self._start_spawn(
                 idle_workers[0], skill, reply_to, task=task, explicit_worker=False
@@ -658,6 +710,7 @@ class _MasterDispatcherImpl:
             )
         )
         self._inflight.add(t)
+        self._worker_tasks[worker_id] = t
         t.add_done_callback(
             lambda x, wid=worker_id, rt=resolved_reply: self._on_spawn_done(x, wid, rt)
         )
@@ -668,8 +721,22 @@ class _MasterDispatcherImpl:
                 return s.last_skill
         return "?"
 
+    async def stop_worker(self, worker_id: str) -> bool:
+        task = self._worker_tasks.get(worker_id)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return True
+
     async def set_paused(self, paused: bool) -> None:
         self._paused[0] = paused
+        self._persist_queues()
+        if not paused:
+            self._schedule_drain()
 
     async def probe_extension_connectivity(self, worker_id: str) -> bool:
         """Real-time check: does this worker's bridge talk to the browser
@@ -861,6 +928,7 @@ class _MasterDispatcherImpl:
                 f"- 启动时是否打开了 work.1688.com(扩展靠这个唤醒)\n"
                 f"- (耗时 {result.elapsed_secs:.1f}s,杀了 {result.force_killed} 个进程)",
             )
+        self._unhealthy.discard(worker_id)
         return success_card(
             f"[{machine_name}] {worker_id} 浏览器已重启",
             f"- 旧窗口已关闭({result.graceful_window_count} 个 main window)\n"
@@ -954,6 +1022,15 @@ async def _notify_task_done(
             f"[{machine_label}] {worker_id} 任务完成",
             f"- 任务: `{label}`\n- 退出码: `0` (OK)\n- 耗时: {elapsed_s:.1f}s{file_line}",
         )
+        if label == "ecom-best-source":
+            from agent.artifacts import validate_sourcing_output
+            manifest = next((m for f in files if (m := validate_sourcing_output(f))), None)
+            if manifest is None:
+                card = error_card(f"[{machine_label}] {worker_id} 产出校验失败", "任务未生成可验证的找货结果，请查看日志。")
+            else:
+                from agent.cards import info_card
+                top = "\n".join(f"- {item['title']}：{item['unit_price']} 元；{item['link']}" for item in manifest.get("top3") or [])
+                card = info_card(f"[{machine_label}] {worker_id} 找货：{manifest['status']}", f"合格 {manifest['final_count']} 条，待确认 {manifest.get('pending_count', 0)} 条；耗时 {elapsed_s:.1f}s\n{top}{file_line}")
     else:
         status = _exit_code_label(exit_code)
         card = error_card(
@@ -963,7 +1040,25 @@ async def _notify_task_done(
     await reply_to.send_card(card)
     # Best-effort: upload artifacts if channel supports files.
     for f in files:
-        await reply_to.send_file(f)
+        if label == "ecom-best-source":
+            from agent.artifacts import validate_sourcing_output
+            if validate_sourcing_output(f) is None:
+                continue
+        if not reply_to.supports_files:
+            continue
+        delivered = False
+        for attempt in range(3):
+            if await reply_to.send_file(f):
+                delivered = True
+                break
+            if attempt < 2:
+                await asyncio.sleep(attempt + 1)
+        from agent.ecom_modules import load_scripts
+        load_scripts()
+        from runtime_support import atomic_json
+        atomic_json(f.parent / ("." + f.name + ".delivery.json"), {"delivered": delivered, "path": str(f), "target_id": reply_to.target_id, "app_id": getattr(reply_to.channel, "app_id", ""), "attempts": attempt + 1})
+        if not delivered:
+            await reply_to.send_card(error_card(f"[{machine_label}] 文件交付失败", f"`{f.name}` 已生成，但上传失败；文件保留在本地，可单独重试交付。"))
 
 
 def _make_output_dir(project_root: Path, worker_id: str) -> Path:
@@ -1074,6 +1169,11 @@ async def _spawn_worker(
     env["WORKER_OUTPUT_DIR"] = str(output_dir)
     env["WORKER_PROJECT_ROOT"] = str(project_root.resolve())
     env["WORKER_SKILL_NAME"] = label
+    original_task = extra_args[extra_args.index("--task") + 1] if "--task" in extra_args else extra_args[extra_args.index("--freeform") + 1] if "--freeform" in extra_args else ""
+    if tracker is not None and label == "ecom-best-source":
+        previous = next((s for s in tracker.snapshot() if s.worker_id == wc.worker_id), None)
+        if previous and previous.last_task == original_task and previous.output_dir:
+            env["WORKER_RESUME_DIR"] = previous.output_dir
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("ab") as log_fh:
@@ -1092,7 +1192,7 @@ async def _spawn_worker(
             cwd=str(project_root),
         )
         if tracker is not None:
-            tracker.update_spawn(wc.worker_id, label, proc.pid)
+            tracker.update_spawn(wc.worker_id, label, proc.pid, task=original_task, output_dir=str(output_dir))
 
         # Watchdog slider-alert needs (channel, chat_id) too; reuse reply_to.
         slider_channel = reply_to.channel if (reply_to and reply_to.is_valid) else None
@@ -1101,7 +1201,22 @@ async def _spawn_worker(
             proc, wc, log_path, label, slider_channel, slider_chat_id,
         )
 
-        exit_code = await proc.wait()
+        try:
+            exit_code = await proc.wait()
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            for watchdog in watchdog_tasks:
+                watchdog.cancel()
+            await asyncio.gather(*watchdog_tasks, return_exceptions=True)
+            if tracker is not None:
+                tracker.update_exit(wc.worker_id, -15)
+            raise
 
         for t in watchdog_tasks:
             t.cancel()
@@ -1247,7 +1362,7 @@ async def fire_due_entries(
         return fallback_reply
 
     async def _fire(entry: ScheduleEntry) -> tuple[ScheduleEntry, int]:
-        if entry.worker in _unhealthy:
+        if entry.worker in _unhealthy and entry.skill != "ecom-best-source":
             print(f"[health] skipping schedule #{entry.id} — {entry.worker} is unhealthy")
             return (entry, -2)
         wc = _resolve_worker(config, entry.worker)
@@ -1263,14 +1378,19 @@ async def fire_due_entries(
         try:
             ts = _timestamp()
             log_path = config.log_dir / f"worker-{entry.worker}-{ts}.log"
+            if dispatcher is not None and not dry_run:
+                dispatcher._worker_tasks[entry.worker] = asyncio.current_task()
             code = await spawn_one_skill(
                 wc, entry.skill, log_path, dry_run=dry_run, tracker=tracker,
                 reply_to=_reply_for_entry(entry), machine_name=machine_name,
                 project_root=config.project_root,
+                task=entry.task,
             )
             return (entry, code)
         finally:
             if dispatcher is not None and not dry_run:
+                if dispatcher._worker_tasks.get(entry.worker) is asyncio.current_task():
+                    dispatcher._worker_tasks.pop(entry.worker, None)
                 dispatcher._release_worker(entry.worker)
                 dispatcher._schedule_drain(entry.worker)
 
@@ -1481,7 +1601,7 @@ def _active_skills_require_browser_mcp(skills_dir: Path) -> bool:
 
 
 async def main_loop(config: MasterConfig, dry_run: bool = False) -> None:
-    tracker = WorkerStateTracker()
+    tracker = WorkerStateTracker(config.project_root / "state" / "workers.json")
     paused: list[bool] = [False]
     store = ScheduleStore(config.project_root / SCHEDULE_STATE_PATH)
     unhealthy: set[str] = set()    # filled after health check; dispatcher holds the ref
@@ -1490,6 +1610,8 @@ async def main_loop(config: MasterConfig, dry_run: bool = False) -> None:
         config, tracker, store, paused,
         unhealthy=unhealthy,
     )
+    if dispatcher._restored_queue:
+        dispatcher._restore_queues()
 
     skills_dir = config.skills.dir
     knowledge_dir = config.knowledge.root

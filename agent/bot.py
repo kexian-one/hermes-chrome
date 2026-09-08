@@ -13,7 +13,7 @@ from agent.channels import ReplyTarget
 from agent.config import BotConfig, LLMSettings
 from agent.conversation import ConversationBuffer
 from agent.intents import MasterDispatcher, handle
-from agent.llm_client import LLMClient
+from agent.llm_client import LLMClient, non_thinking_body
 from agent.nlu import IntentDispatch, route
 
 # How many user messages to pull from Feishu chat history per @bot trigger.
@@ -111,6 +111,7 @@ async def _fetch_parent_text(channel, parent_id: str) -> str:
 
 async def _fetch_chat_context(
     channel, chat_id: str, exclude_message_id: str, bot_open_id: str,
+    sender_open_id: str = "",
 ) -> list[tuple[str, str, str]]:
     """Pull the last N text/post messages from this Feishu chat as NLU context.
 
@@ -156,6 +157,8 @@ async def _fetch_chat_context(
             if create_ts < cutoff_ms:
                 break    # rest are even older
             sender = m.sender
+            if sender_open_id and (not sender or sender.id != sender_open_id):
+                continue
             is_bot = (sender and (sender.sender_type == "app" or sender.id == bot_open_id))
             if is_bot:
                 # Bot replies are cards — too structured to feed as user-style
@@ -198,19 +201,13 @@ async def run_bot(
         app_secret=config.app_secret,
     )
 
-    # NLU is short intent classification — disable thinking explicitly.
-    # DeepSeek's thinking is on by default and adds 5-30s of reasoning per call,
-    # which a) makes "查状态" feel sluggish and b) raises stream-truncation
-    # rate. Worker LLMClient (in agent/worker.py) keeps default behavior so
-    # complex skills can still benefit from thinking.
-    # `extra_body` is forwarded as-is; non-DeepSeek providers will ignore the
-    # unknown field.
+    # Short intent classification uses the provider-specific non-thinking mode.
     llm = LLMClient(
         base_url=llm_settings.base_url,
         api_key=llm_settings.api_key,
         model=llm_settings.model,
         provider=llm_settings.provider,
-        extra_body={"thinking": {"type": "disabled"}},
+        extra_body=non_thinking_body(llm_settings.model, llm_settings.extra_body),
         max_tokens=2048,
         temperature=0.0,
         mcp_server_config=llm_settings.mcp_server_config,
@@ -242,10 +239,12 @@ async def run_bot(
                 bot_open_id = getattr(ident, "open_id", "") or ""
         except Exception:
             pass
-        recent = await _fetch_chat_context(channel, chat_id, msg.id, bot_open_id)
+        conversation_id = f"{chat_id}:{sender_open_id}"
+        from agent.nlu import fast_route
+        recent = [] if fast_route(text) else await _fetch_chat_context(channel, chat_id, msg.id, bot_open_id, sender_open_id)
         fetched_from_feishu = bool(recent)
-        if not recent:
-            recent = buffer.recent(chat_id)
+        if not recent and not fast_route(text):
+            recent = buffer.recent(conversation_id)
 
         # Feishu "reply / 引用": user pointed at one specific message.
         # Read parent_id from raw payload (more reliable than the
@@ -328,7 +327,7 @@ async def run_bot(
             text.split("[用户本次说]: ", 1)[-1]
             if "[用户本次说]: " in text else text
         )
-        buffer.append(chat_id, original_text, intent_str, summary)
+        buffer.append(conversation_id, original_text, intent_str, summary)
 
         try:
             await channel.send(msg.chat_id, {"card": reply_card})

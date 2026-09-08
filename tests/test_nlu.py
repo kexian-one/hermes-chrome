@@ -69,7 +69,7 @@ async def test_route_malformed_json_falls_back_to_unknown():
 async def test_route_llm_exception_falls_back_to_unknown():
     llm = MagicMock(spec=LLMClient)
     llm.chat = AsyncMock(side_effect=RuntimeError("network error"))
-    result = await route("查状态", llm)
+    result = await route("帮我看看工号现在是否忙碌", llm)
     assert result.intent == Intent.UNKNOWN
 
 
@@ -152,7 +152,7 @@ async def test_route_ecom_preserves_jd_url_when_llm_summarizes_task():
         llm,
     )
     assert result.intent == Intent.RUN_NOW
-    assert result.args["task"] == "要3 https://item.jd.com/10159624742014.html"
+    assert result.args["task"] == "@开票助手1号 [六神花露水 - 京东](https://item.jd.com/10159624742014.html) 要3"
     assert result.args["worker_explicit"] is False
 
 
@@ -170,7 +170,7 @@ async def test_route_ecom_does_not_duplicate_existing_task_url():
         "@开票助手1号 [六神花露水 - 京东](https://item.jd.com/10159624742014.html) 要3",
         llm,
     )
-    assert result.args["task"] == "要3 https://item.jd.com/10159624742014.html"
+    assert result.args["task"] == "@开票助手1号 [六神花露水 - 京东](https://item.jd.com/10159624742014.html) 要3"
     assert result.args["worker_explicit"] is False
 
 
@@ -384,9 +384,9 @@ async def test_nlu_without_recent_context_no_prefix():
 
     llm.chat = fake_chat
 
-    result = await route("查状态", llm, recent_turns=None)
+    result = await route("请查一下所有工号的运行状态", llm, recent_turns=None)
     assert result.intent == Intent.QUERY_STATUS
 
     user_msg = captured_messages[0][1]["content"]
     assert "Recent conversation" not in user_msg
-    assert user_msg == "查状态"
+    assert user_msg == "请查一下所有工号的运行状态"

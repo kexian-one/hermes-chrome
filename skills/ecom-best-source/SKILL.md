@@ -1,12 +1,16 @@
 ---
 name: ecom-best-source
 description: JD/B2B 京东商品找 1688 同款货源、比价、批量找供应商。用于用户说找货源、找同款、1688 比价、哪里进货便宜、给 b2b.jd.com 或 item.jd.com 链接要找可采购货源时。优先用 1688 API/MCP/接口召回和详情，最终筛选只按价格和综合服务分排序，移除发票能力、回头率、响应率；不要依赖外部 huoyuan 文件夹。
-requires_browser_mcp: true
+requires_browser_mcp: false
 ---
 
 # 电商找最优货源
 
 目标: 从 JD 或京东万商商品出发，找 1688 可采购同款货源，最终只输出 1 个 CSV。不要依赖外部 `huoyuan`；它只是历史参考，执行时不得读取、导入或调用任何机器上的历史 `huoyuan` 目录。
+
+## 默认执行入口
+
+带任务原文的找货由 agent/ecom_workflow.py 执行固定流程：目标提取 → 属性归一 → 图文检索 → 逐SKU详情 → 图片核验 → 价格库存刷新 → 排序 → CSV与manifest。文本与图片均默认千问3.8 Flash。下文独立脚本用于调试/冻结数据回放，不替代默认流程的图片核验。
 
 ## 核心原则
 
@@ -14,9 +18,9 @@ requires_browser_mcp: true
 - JD/B2B 侧需要价格、已选 SKU 或起购倍数时，必须优先用当前 worker 的浏览器 MCP/OICC 登录态页面一次性读取商品数据；不要把静态 HTML 当作第一信息源。
 - 1688 侧召回、图搜、详情能走 API/MCP 就走 API/MCP；浏览器只做缺工具时的兜底。
 - 最后筛选先硬过滤品牌/品类/SKU/规格，再只按价格和综合服务分排序。移除发票能力、回头率、响应率三个原维度；原 `50:20` 比例归一后为价格 71.43%、综合服务分 28.57%；综合服务分 <3、入驻 <1 年降为不推荐。
-- `SKU不一致`、品牌不匹配、品类不匹配、价格不合适、明确无库存、综合得分低于 60 的候选不能进入最终 CSV；只能进入 rejected / scratch JSON。不要用低价错货凑 Top 6。
-- 普通 `item.jd.com` 如果用户没给目标 SKU/规格，先问清楚；`b2b.jd.com/goods/goods-detail/...` 直接按页面已选 SKU。
-- 最终 CSV 必须包含完整 1688 详情链接、价格、起批数/库存判断和 Top 6 推荐。
+- `SKU不一致`、品牌不匹配、品类不匹配、价格不合适、明确无库存 的候选不能进入最终 CSV；只能进入 rejected / scratch JSON。不要用低价错货凑 Top 6。
+- 按用户明确要求和页面已选SKU确认目标。目标证据冲突需核实；关键证据不足待确认，不能猜规格。
+- CSV包含完整链接、SKU ID、双方规格/图片、差异、图片核验、价格、MOQ、库存和采购量。合格不足6条不凑数，待确认单独显示。
 
 ## 推荐流程
 
@@ -34,13 +38,7 @@ requires_browser_mcp: true
 
 ## 停止条件
 
-`sourcing_pipeline.py` 返回 `ok=true` 且 stdout 里的 `final_count > 0` 后，任务已经完成:
-
-- 直接用 stdout 里的 `top3` 回复用户。
-- 不要再读取 CSV、`final_filter_rules.md`、`sourcing_rules.py` 或 `sourcing_pipeline.py`。
-- 不要再运行 `sourcing_rules.py`。
-- 不要再写 `merged_input.json`、`final.json` 或任何调试 JSON。
-- 不要为了复核重新生成同一个 CSV。
+CSV和配套manifest通过哈希、表头、合格行数校验后结束，不重复生成。分别报告ok、召回不足、无供给、部分完成；异常不能伪装成无供给。保存checkpoint、metrics和原始任务，失败重启可恢复未过期阶段。
 
 JD/B2B 登录态字段采集见 `references/jd_browser_product_source.md`。详细数据源路由见 `references/api_mcp_sources.md`。详细筛选规则见 `references/final_filter_rules.md`。数据结构见 `references/data_schema.md`。
 
@@ -121,7 +119,7 @@ python skills/ecom-best-source/scripts/sourcing_pipeline.py --jd-product jd_prod
 - 从 `jd_product.json` 合成 target / query 相关字段。
 - 从 `candidates.json` 读取候选并套用 `sourcing_rules.py` 的最终筛选规则；规则会排除品牌/品类/SKU 不一致的候选。
 - 写 CSV 前会对缺少可判断详情/库存的最终候选补拉 `item_get`，再重新筛选；明确无库存或价格不合适的候选会被剔除，库存字段缺失时才显示“待确认”。
-- 直接写出带 UTF-8 BOM 的最终 CSV，字段包含 Top 6、价格、总进货价、利润率、邮费、起批数、规格匹配、库存、店铺、综合服务分、经营年限、风险说明和完整 1688 链接；不要输出排名、得分、推荐理由列。总进货价 = 1688 SKU 价格 × 用户数量；利润率 = (京东单价 × 用户数量 - 总进货价) / (京东单价 × 用户数量)，百分比保留两位小数。邮费只展示接口/页面能确认的信息，不计算总价；明确包邮时写“包邮”。
+- 直接写出带 UTF-8 BOM 的最终 CSV，字段包含 Top 6、价格、总进货价、利润率、邮费、起批数、规格匹配、库存、店铺、综合服务分、经营年限、风险说明和完整 1688 链接；不要输出排名、得分、推荐理由列。总进货价 = SKU阶梯价 × 实际SKU采购数量；明确允许包装替代时折算件数并向上取整。利润率 = (京东单价 × 用户数量 - 总进货价) / (京东单价 × 用户数量)，百分比保留两位小数。邮费只展示接口/页面能确认的信息，不计算总价；明确包邮时写“包邮”。
 - 在 stdout 返回 `status`、`final_count`、`csv_path` 和 `top3`。回复用户只需要用这些字段，不需要再读 CSV 或规则源码。
 
 只有人明确要求调试规则脚本时，才单独运行最终筛选脚本。正常找货任务禁止在 `sourcing_pipeline.py` 成功后再运行它:

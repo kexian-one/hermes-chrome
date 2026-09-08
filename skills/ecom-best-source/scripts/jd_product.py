@@ -6,15 +6,13 @@ import json
 import re
 import sys
 import urllib.request
+from urllib.parse import urlsplit
 from html.parser import HTMLParser
 from typing import Any
+from identifier_sources import identifiers_from_data
 
 
-JD_IMAGE_RE = re.compile(
-    r"(?:https?:)?//img\d{2,}\.360buyimg\.com/[^\s\"'<>\\]+",
-    re.IGNORECASE,
-)
-ITEM_ID_RE = re.compile(r"(?:item\.jd\.com/|sku=|wareId=|goods-detail/)(\d+)", re.IGNORECASE)
+ITEM_ID_RE = re.compile(r"(?:item\.jd\.com/|item\.m\.jd\.com/product/|(?:sku|skuId|wareId)=|goods-detail/)(\d+)", re.IGNORECASE)
 SCRIPT_JSON_RE = re.compile(
     r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
     re.IGNORECASE | re.DOTALL,
@@ -26,18 +24,37 @@ class ProductHTMLParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.meta: list[dict[str, str]] = []
         self.title_parts: list[str] = []
+        self.canonical_url = ""
+        self.product_images: list[str] = []
+        self._elements: list[tuple[str, dict[str, str]]] = []
         self._in_title = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
         attr = {k.lower(): (v or "") for k, v in attrs}
         if tag.lower() == "meta":
             self.meta.append(attr)
+        elif tag.lower() == "link" and "canonical" in attr.get("rel", "").lower().split():
+            self.canonical_url = attr.get("href", "")
         elif tag.lower() == "title":
             self._in_title = True
+        if tag == "img":
+            markers = [" ".join(a.get(k, "") for k in ("id", "class")).lower() for _, a in self._elements]
+            gallery = any(any(key in marker for key in ("spec-n1", "spec-list", "gallery", "preview")) for marker in markers)
+            gallery |= any("goodsdetail" in marker for marker in markers) and any("image" in marker for marker in markers)
+            recommendation = any(any(key in marker for key in ("recommend", "suggest", "猜你喜欢")) for marker in markers)
+            if gallery and not recommendation:
+                self.product_images.extend(attr[key] for key in ("data-origin", "data-original", "data-src", "data-lazy-img", "src") if attr.get(key))
+        if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
+            self._elements.append((tag, attr))
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "title":
             self._in_title = False
+        for index in range(len(self._elements) - 1, -1, -1):
+            if self._elements[index][0] == tag.lower():
+                del self._elements[index:]
+                break
 
     def handle_data(self, data: str) -> None:
         if self._in_title:
@@ -71,25 +88,33 @@ def parse_product_html(text: str, url: str) -> dict[str, Any]:
     )
     title = _clean_title(title)
 
-    images: list[str] = []
-    for value in (
-        _first_meta(meta, "property", "og:image"),
-        _first_meta(meta, "name", "image"),
-        _jsonld_image(text),
-    ):
-        if value:
-            images.append(value)
-    images.extend(JD_IMAGE_RE.findall(text))
-    image_urls = _unique(_normalize_image_url(x) for x in images if x)
-
-    image_urls = _sort_image_urls(image_urls)
+    requested_id = _item_id(url)
+    page_ids = {_item_id(value) for value in (
+        parser.canonical_url, _first_meta(meta, "property", "og:url"),
+    ) if _item_id(value)}
+    conflicting_page = bool(requested_id and any(value != requested_id for value in page_ids))
+    item_id = requested_id or (next(iter(page_ids)) if len(page_ids) == 1 else "")
+    structured = _jsonld_product(text, item_id)
+    if structured and _title_score(title) <= 0:
+        title = _clean_title(str(structured.get("name") or ""))
+    images = [u for u in _image_values(structured.get("image")) if _supported_product_image(u)] if structured else []
+    scope = "selected_sku" if images else "product_page"
+    image_source = "jsonld_sku" if images else "page_metadata"
+    if not images and item_id and _title_score(title) > 0:
+        images = [_first_meta(meta, "property", "og:image"), _first_meta(meta, "name", "image"), *parser.product_images]
+        image_source = "page_metadata_or_gallery"
+    image_urls = _unique(_normalize_image_url(x) for x in images if _supported_product_image(x)) if not conflicting_page else []
 
     return {
         "title": title,
         "jd_url": url,
-        "item_id": _item_id(url) or _item_id(text),
+        "item_id": item_id,
         "main_image_url": image_urls[0] if image_urls else "",
         "image_urls": image_urls[:12],
+        "image_urls_scope": scope if image_urls else "unconfirmed",
+        "image_evidence": [{"url": image, "source": image_source, "item_id": item_id} for image in image_urls[:12]],
+        "target_errors": ["京东页面商品 ID 与请求 SKU 不一致"] if conflicting_page else [],
+        "identifiers": identifiers_from_data(structured, "jd_jsonld_sku") if structured and not conflicting_page else [],
     }
 
 
@@ -107,28 +132,13 @@ def _fetch_fallback_products(item_id: str, timeout: int) -> list[dict[str, Any]]
 
 
 def _best_product_result(products: list[dict[str, Any]]) -> dict[str, Any]:
-    best_title = ""
-    best_url = ""
-    item_id = ""
-    images: list[str] = []
-    for product in products:
-        title = str(product.get("title") or "").strip()
-        if _title_score(title) > _title_score(best_title):
-            best_title = title
-            best_url = str(product.get("jd_url") or "")
-        if not item_id:
-            item_id = str(product.get("item_id") or "")
-        raw_images = product.get("image_urls") or []
-        if isinstance(raw_images, list):
-            images.extend(str(u) for u in raw_images if u)
-    images = _sort_image_urls(_unique(images))
-    return {
-        "title": best_title,
-        "jd_url": best_url or (products[0].get("jd_url") if products else ""),
-        "item_id": item_id,
-        "main_image_url": images[0] if images else "",
-        "image_urls": images[:12],
-    }
+    if not products:
+        return {}
+    item_id = str(products[0].get("item_id") or "")
+    eligible = [p for p in products if not p.get("target_errors") and (not item_id or str(p.get("item_id") or "") == item_id)]
+    if not eligible:
+        return dict(products[0])
+    return dict(max(eligible, key=lambda p: (_title_score(str(p.get("title") or "")), bool(p.get("main_image_url")))))
 
 
 def _http_get_text(url: str, timeout: int) -> str:
@@ -162,19 +172,42 @@ def _first_meta(meta: list[dict[str, str]], key: str, value: str) -> str:
     return ""
 
 
-def _jsonld_image(text: str) -> str:
+def _jsonld_product(text: str, item_id: str) -> dict[str, Any]:
+    if not item_id:
+        return {}
     for match in SCRIPT_JSON_RE.finditer(text):
         raw = html.unescape(match.group(1)).strip()
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        image = data.get("image") if isinstance(data, dict) else None
-        if isinstance(image, str):
-            return image
-        if isinstance(image, list) and image:
-            return str(image[0])
-    return ""
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            graph = node.get("@graph")
+            if isinstance(graph, list):
+                nodes.extend(graph)
+            kinds = node.get("@type") or []
+            kinds = [kinds] if isinstance(kinds, str) else kinds
+            if "Product" not in kinds:
+                continue
+            ids = {str(node[key]) for key in ("sku", "skuId", "productID") if node.get(key) is not None}
+            ids.update(_item_id(str(node.get(key) or "")) for key in ("url", "@id"))
+            ids.discard("")
+            if ids == {item_id}:
+                return node
+    return {}
+
+
+def _image_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return _image_values(value.get("contentUrl") or value.get("url"))
+    if isinstance(value, list):
+        return [image for entry in value for image in _image_values(entry)]
+    return []
 
 
 def _clean_title(value: str) -> str:
@@ -194,6 +227,17 @@ def _normalize_image_url(value: str) -> str:
     url = re.sub(r"\.webp$", "", url)
     url = url.rstrip(")")
     return url
+
+
+def _supported_product_image(value: str) -> bool:
+    try:
+        parsed = urlsplit(_normalize_image_url(value))
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(parsed.scheme in {"http", "https"} and not parsed.username and not parsed.password
+                and any(host == suffix or host.endswith("." + suffix) for suffix in ("360buyimg.com", "jdimg.com"))
+                and not re.search(r"imagetools|placeholder|/logo|/blank|\.gif$", parsed.path, re.I))
 
 
 def _item_id(value: str) -> str:
@@ -226,25 +270,6 @@ def _title_score(title: str) -> int:
         score -= 30
     if re.search(r"[\u4e00-\u9fff].*(g|ml|kg|L|克|毫升|瓶|箱)", text, re.IGNORECASE):
         score += 20
-    return score
-
-
-def _sort_image_urls(urls: list[str]) -> list[str]:
-    return sorted(urls, key=_image_score, reverse=True)
-
-
-def _image_score(url: str) -> int:
-    score = 0
-    if re.search(r"/n\d+/", url):
-        score += 50
-    if re.search(r"s\d+x\d+", url):
-        score += 20
-    if "/img/" in url:
-        score += 5
-    if any(part in url for part in ("/jdphoto/", "/devfe/", "/imagetools/")):
-        score -= 30
-    if re.search(r"\.(jpg|jpeg|png)$", url, re.IGNORECASE):
-        score += 2
     return score
 
 

@@ -107,7 +107,7 @@ def freeform_card_with_stop(title: str, body_markdown: str, worker_id: str) -> d
     base = warning_card(title, body_markdown)
     stop_btn = _button(
         "强制停止",
-        {"intent": "restart_worker", "args": {"worker_id": worker_id}},
+        {"intent": "stop_worker", "args": {"worker_id": worker_id}},
         "danger",
     )
     base["elements"].append(_action_element([stop_btn]))

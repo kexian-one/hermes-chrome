@@ -4,6 +4,10 @@ This directory sets up 6 independent instances of
 [open-claude-in-chrome](https://github.com/noemica-io/open-claude-in-chrome)
 (one per browser, ports 18765–18770).
 
+The upstream revision is pinned in `oicc-revision.txt` to the TCP-compatible runtime. Both setup scripts call `patch_oicc.py`, verify required tools and use the npm lock. A mismatched checkout fails explicitly; back it up before intentionally recreating it. Newer upstream revisions use named pipes and require coordinated Python bridge changes.
+
+Windows: run the root `setup.ps1` first. Dry-run does not register extensions or start browsers.
+
 ## Supported OS / Prerequisites
 
 - macOS 13+ or Windows 10/11

@@ -6,57 +6,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from attribute_schema import BRAND_ALIAS_EXPAND, CATEGORY_WORDS, category_aliases
+from product_match import FLAVORS, FORM_VALUES, normalize_value, parse_attributes
 
-BRAND_ALIAS_EXPAND: dict[str, list[str]] = {
-    "红鸟": ["红鸟", "RED BIRD", "红鸟RED BIRD", "庄臣红鸟", "庄臣"],
-    "绿劲": ["绿劲", "立白绿劲", "绿劲妈妈"],
-    "海天": ["海天", "海天酱油", "海天味业"],
-    "立白": ["立白", "Liby", "立白集团"],
-    "白猫": ["白猫", "白猫日化"],
-    "宝洁": ["宝洁", "P&G", "PROCTER", "Procter & Gamble"],
-    "联合利华": ["联合利华", "Unilever"],
-    "蓝月亮": ["蓝月亮", "Bluemoon", "蓝月亮Bluemoon"],
-    "雕牌": ["雕牌", "纳爱斯雕牌", "纳爱斯"],
-    "金龙鱼": ["金龙鱼", "益海嘉里", "金龙鱼Arawana"],
-    "鲁花": ["鲁花", "鲁花花生油"],
-    "李锦记": ["李锦记", "Lee Kum Kee", "李锦记LKK"],
-    "厨邦": ["厨邦", "厨邦酱油", "美味鲜"],
-    "千禾": ["千禾", "千禾味业"],
-    "太太乐": ["太太乐", "太太乐鸡精"],
-    "心相印": ["心相印", "心相印纸巾"],
-    "维达": ["维达", "Vinda", "维达Vinda"],
-    "清风": ["清风", "Breeze", "清风Breeze"],
-    "舒肤佳": ["舒肤佳", "Safeguard", "舒肤佳Safeguard"],
-    "高露洁": ["高露洁", "Colgate", "高露洁Colgate"],
-    "老街口": ["老街口", "老街口瓜子"],
-    "三只松鼠": ["三只松鼠", "Three Squirrels"],
-    "良品铺子": ["良品铺子", "BESTORE"],
-    "百草味": ["百草味", "Be&Cheery"],
-    "卫龙": ["卫龙", "卫龙美味"],
-    "盼盼": ["盼盼", "盼盼食品"],
-    "洽洽": ["洽洽", "洽洽食品", "ChaCheer"],
-    "佳洁士": ["佳洁士", "Crest", "佳洁士Crest"],
-    "黑人": ["黑人", "Darlie", "黑人牙膏"],
-    "飘柔": ["飘柔", "Rejoice", "飘柔Rejoice"],
-    "海飞丝": ["海飞丝", "Head & Shoulders", "海飞丝Head&Shoulders"],
-    "潘婷": ["潘婷", "Pantene", "潘婷Pantene"],
-    "清扬": ["清扬", "CLEAR"],
-}
-
-CATEGORY_WORDS = [
-    "皮鞋油", "果蔬清洁", "餐具净", "鞋蜡", "鞋膏", "鞋油",
-    "洗洁精", "洗衣液", "洗衣粉", "柔顺剂",
-    "卷纸", "抽纸", "纸巾", "湿巾",
-    "牙膏", "牙刷", "漱口水",
-    "洗发水", "护发素", "沐浴露",
-    "奶粉", "辅食",
-    "尿不湿", "纸尿裤",
-    "饮料", "矿泉水", "酸奶",
-    "方便面", "泡面", "桶面", "袋面", "速食面", "拉面",
-    "魔芋爽", "素毛肚", "辣条",
-    "饼干", "坚果", "糖果",
-    "酱油", "料酒", "蚝油", "食用油", "调味料", "醋",
-]
 
 FORM_WORDS = [
     "液体", "固体", "膏体", "油膏", "粉末", "颗粒",
@@ -68,19 +20,12 @@ COLOR_WORDS = [
     "黑色", "白色", "红色", "蓝色", "黄色", "绿色",
     "灰色", "粉色", "紫色", "棕色", "金色", "银色",
     "卡其", "藏青", "自然色", "透明",
-    "黑", "白", "红", "蓝",
 ]
 
-FLAVOR_WORDS = [
-    "柚子金桔", "柚子柠檬", "金桔柠檬", "青柠薄荷",
-    "柚子", "柠檬", "薄荷", "金桔",
-    "红烧牛肉", "香辣牛肉", "酸辣牛肉", "葱香排骨",
-    "红烧", "酸辣", "原味", "麻辣", "香辣", "番茄", "牛肉", "蜂蜜",
-    "海盐", "焦糖", "抹茶", "草莓", "蓝莓", "巧克力",
-]
+FLAVOR_WORDS = list(FLAVORS)
 
 SPEC_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(kg|g|mg|ml|L|克|毫升|斤|两|片|粒|包|瓶|箱|双|个|寸|cm|mm|m)",
+    r"(?<![\d.])(\d+(?:\.\d+)?)\s*(kg|公斤|千克|mg|毫克|g|克|ml|毫升|L|升|斤|两)(?![a-zA-Z])",
     re.IGNORECASE,
 )
 BRAND_CN_EN_RE = re.compile(r"^([\u4e00-\u9fff]{1,6})[（(]([A-Za-z][A-Za-z &]*)[)）]")
@@ -104,7 +49,7 @@ class Keywords:
         if self.category:
             parts.append(self.category)
         if self.variant:
-            parts.append(self.variant[0])
+            parts.extend(self.variant)
         if self.spec:
             parts.append(self.spec)
         return " ".join(parts)
@@ -144,15 +89,15 @@ def build_keywords(title: str, known_brand: str | None = None) -> Keywords:
     return Keywords(
         brand=brand,
         brand_aliases=aliases,
-        category=_extract_first(clean, CATEGORY_WORDS),
-        variant=_extract_variant(clean),
+        category=normalize_value("category", _extract_first(clean, [alias for category in CATEGORY_WORDS for alias in category_aliases(category)])),
+        variant=_extract_variant(clean.replace(brand, "") if brand else clean),
         spec=_extract_spec(clean),
-        form=_extract_first(clean, FORM_WORDS),
+        form=_extract_first(clean, list(FORM_VALUES)),
     )
 
 
 def normalize_title(title: str) -> str:
-    text = DECOR_BRACKETS_RE.sub("", title or "")
+    text = re.sub(r"[【】〖〗\[\]]", " ", title or "")
     noise = ["新品", "热卖", "正品", "官方", "包邮", "旗舰店"]
     for word in noise:
         text = text.replace(word, "")
@@ -161,22 +106,24 @@ def normalize_title(title: str) -> str:
 
 def _extract_brand(title: str, known_brand: str | None) -> tuple[str | None, list[str]]:
     if known_brand:
-        brand = known_brand.strip()
+        brand = normalize_value("brand", known_brand) or known_brand.strip()
         return brand, list(BRAND_ALIAS_EXPAND.get(brand, [brand]))
+    matches = []
     for brand, aliases in BRAND_ALIAS_EXPAND.items():
-        if title.startswith(brand) or brand in title:
-            return brand, list(aliases)
+        for alias in aliases:
+            pattern = re.escape(alias)
+            if alias.isascii():
+                pattern = r"(?<![A-Za-z])" + pattern + r"(?![A-Za-z])"
+            if hit := re.search(pattern, title, re.I):
+                matches.append((hit.start(), -len(alias), brand))
+    if matches:
+        brand = min(matches)[2]
+        return brand, list(BRAND_ALIAS_EXPAND[brand])
     match = BRAND_CN_EN_RE.match(title)
     if match:
         cn = match.group(1)
         en = match.group(2).strip()
         return cn, _uniq([cn, en, f"{cn}{en.title()}"])
-    match = BRAND_CN_RE.match(title)
-    if match:
-        prefix = match.group(1)
-        fallback = prefix[:2]
-        if re.fullmatch(r"[\u4e00-\u9fff]+", fallback):
-            return fallback, [fallback]
     return None, []
 
 
@@ -193,13 +140,8 @@ def _extract_first(title: str, words: list[str]) -> str | None:
 
 
 def _extract_variant(title: str) -> list[str]:
-    variants = []
-    color = _extract_first(title, COLOR_WORDS)
-    flavor = _extract_first(title, FLAVOR_WORDS)
-    for value in (color, flavor):
-        if value and value not in variants:
-            variants.append(value)
-    return variants
+    attrs = parse_attributes(title)
+    return list(dict.fromkeys(attrs[key] for key in ("color", "flavor", "sugar_content", "fat_content") if attrs.get(key)))
 
 
 def _extract_spec(title: str) -> str | None:

@@ -68,9 +68,15 @@ class OpenClaudeInChromeClient:
             cwd=str(self._script.parent),
         )
 
-        read, write = await self._stack.enter_async_context(stdio_client(params))
-        self._session = await self._stack.enter_async_context(ClientSession(read, write))
-        await self._session.initialize()
+        try:
+            read, write = await self._stack.enter_async_context(stdio_client(params))
+            self._session = await self._stack.enter_async_context(ClientSession(read, write))
+            await self._session.initialize()
+        except BaseException:
+            await self._stack.aclose()
+            self._stack = None
+            self._session = None
+            raise
         return self
 
     async def __aexit__(self, *exc) -> None:

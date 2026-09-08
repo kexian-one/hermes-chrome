@@ -1,71 +1,31 @@
-# start.ps1 — restart master orchestrator on this machine
-#
-# What it does (in order):
-#   1. Kill any running python.exe whose command line mentions agent.master /
-#      agent.worker / agent.bot — these are this project's processes.
-#   2. Kill any running node.exe whose command line mentions
-#      deploy/oicc-*/host/mcp-server.js — these are the PRIMARY MCP keepalives
-#      spawned by the old master.
-#   3. Self-heal native messaging registry entries (HKCU). Edge auto-update
-#      occasionally wipes sideloaded extensions' native host registry; this
-#      step ensures the entry pointed at by the existing manifest under
-#      deploy\oicc-bN\manifest\ is present in the right browser's HKCU node.
-#   4. Ensure logs/ exists.
-#   5. Launch `python -m agent.master` detached, redirecting stdout+stderr to
-#      logs/master.log (append).
-#   6. Print the new master PID and how to tail the log.
-#
-# Usage:  powershell -ExecutionPolicy Bypass -File .\start.ps1
-# or just:  .\start.ps1   (from a PowerShell prompt in d:\ai\all-in-ai)
+﻿# Restart this project master with the locked environment; active workers must finish first.
+# Keeps the independently supervised browser bridge running. Use -DryRun to inspect.
 
+[CmdletBinding(SupportsShouldProcess)]
+param([switch]$DryRun)
 $ErrorActionPreference = 'Stop'
-
-# Pin working dir to this script's location so relative paths in master
-# (state/, logs/, config.yaml) resolve correctly even if launched from
-# another folder.
-Set-Location -Path $PSScriptRoot
-
-Write-Host "[start.ps1] killing old processes..."
-
-$pythonPattern = 'agent\.(master|worker|bot)'
-$nodePattern   = 'deploy[\\/]oicc-\w+[\\/]host[\\/]mcp-server\.js'
-
-$killed = @()
-Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='node.exe'" |
-    Where-Object {
-        ($_.Name -eq 'python.exe' -and $_.CommandLine -match $pythonPattern) -or
-        ($_.Name -eq 'node.exe'   -and $_.CommandLine -match $nodePattern)
-    } |
-    ForEach-Object {
-        $pidNum = $_.ProcessId
-        $name  = $_.Name
-        try {
-            Stop-Process -Id $pidNum -Force -ErrorAction Stop
-            $killed += "  killed pid=$pidNum ($name)"
-        } catch {
-            $killed += "  FAILED to kill pid=$pidNum ($name): $($_.Exception.Message)"
-        }
-    }
-
-if ($killed.Count -eq 0) {
-    Write-Host "  (no existing master/worker/mcp processes)"
-} else {
-    $killed | ForEach-Object { Write-Host $_ }
+Set-Location -LiteralPath $PSScriptRoot
+$taskPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $taskPython)) { throw 'Run .\setup.ps1 first to create the locked Python environment.' }
+$taskConfig = if ($env:ALL_IN_AI_CONFIG) { $env:ALL_IN_AI_CONFIG } else { Join-Path $PSScriptRoot 'config.yaml' }
+if ($DryRun -or $WhatIfPreference) {
+    Write-Host "DRY RUN: project=$PSScriptRoot; python=$taskPython; config=$taskConfig"
+    Write-Host 'Check active workers; restart this project master; ensure OICC bridge; run browser smoke checks.'
+    return
 }
+$taskRootPattern = [regex]::Escape($PSScriptRoot)
+$taskProcesses = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object {
+    $_.CommandLine -match $taskRootPattern -and $_.CommandLine -match 'agent\.(master|worker|bot)'
+})
+if (@($taskProcesses | Where-Object { $_.CommandLine -match 'agent\.worker' }).Count -gt 0) {
+    throw 'This project has active workers. Wait for completion before restarting.'
+}
+foreach ($taskProcess in $taskProcesses) {
+    if ($PSCmdlet.ShouldProcess("PID $($taskProcess.ProcessId)", 'Restart project master')) { Stop-Process -Id $taskProcess.ProcessId -Force }
+}
+& $taskPython -m scripts.oicc_bridge start
+if ($LASTEXITCODE -ne 0) { Write-Warning 'Browser bridge is unavailable. Sourcing will use its static/API fallback.' }
 
-# Give the OS a moment to release sockets (TCP 18766 etc.) before relaunch.
-Start-Sleep -Milliseconds 800
-
-# --- Native messaging registry self-heal ----------------------------------
-# Read config.yaml's `browsers:` block to learn which Chromium variant each
-# worker uses (b2→edge, b3→chrome, …), then make sure
-# HKCU:\Software\<vendor>\NativeMessagingHosts\com.anthropic.open_claude_in_chrome.b<N>
-# points to the manifest file under deploy\oicc-b<N>\manifest\.
-#
-# Why this is here: Edge auto-updates sometimes wipe sideloaded extensions'
-# HKCU entries during a PC restart, breaking native messaging silently. The
-# extension keeps retrying connectNative every 24s but Edge has no host to
-# launch. Re-asserting the key is idempotent and cheap.
 $BrowserVendors = @{
     edge     = 'Microsoft\Edge'
     chrome   = 'Google\Chrome'
@@ -80,7 +40,7 @@ $BrowserVendors = @{
 $configBrowsers = @{}
 $currentWorker = $null
 $inBrowsersBlock = $false
-foreach ($line in Get-Content (Join-Path $PSScriptRoot 'config.yaml')) {
+foreach ($line in Get-Content -LiteralPath $taskConfig) {
     if ($line -match '^browsers:\s*$') { $inBrowsersBlock = $true; continue }
     if ($inBrowsersBlock -and $line -match '^[a-zA-Z_]') { $inBrowsersBlock = $false }
     if (-not $inBrowsersBlock) { continue }
@@ -143,7 +103,7 @@ Add-Content -Path $logOut -Value "`n========== restart $ts ==========" -Encoding
 Write-Host "[start.ps1] launching master..."
 
 $proc = Start-Process `
-    -FilePath 'python' `
+    -FilePath $taskPython `
     -ArgumentList '-u', '-m', 'agent.master' `
     -WorkingDirectory $PSScriptRoot `
     -RedirectStandardOutput $logOut `
@@ -162,3 +122,6 @@ Write-Host ("[start.ps1] master started, pid={0}" -f $proc.Id) -ForegroundColor 
 Write-Host "[start.ps1] main log (stderr): $logErr"
 Write-Host "[start.ps1] stdout log:         $logOut"
 Write-Host "[start.ps1] tail with:  Get-Content -Path $logErr -Wait -Tail 50"
+
+& $taskPython -m scripts.browser_tab_smoke --require-listener --timeout 15
+if ($LASTEXITCODE -ne 0) { Write-Warning "Some browser workers are unavailable; check extension setup before live SKU validation." }

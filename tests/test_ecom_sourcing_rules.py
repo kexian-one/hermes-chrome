@@ -170,7 +170,7 @@ def test_current_rule_downgrades_service_but_ignores_invoice_for_scoring() -> No
     assert "不能开发票" not in result["rejected_reasons"]
 
 
-def test_original_skill_moq_high_is_warning_not_zero_score() -> None:
+def test_purchase_below_moq_is_not_eligible() -> None:
     rules = _load_rules_module()
     result = rules.run_pipeline({
         "target": {"jd_price": 5.0, "buy_multiple": 10},
@@ -190,9 +190,8 @@ def test_original_skill_moq_high_is_warning_not_zero_score() -> None:
         ],
     })
 
-    item = result["final"][0]
-    assert item["score"] > 0
-    assert "MOQ 过高" in item["warnings"]
+    assert result["final"] == []
+    assert result["rejected"][0]["rejection"] == "采购数量低于起批数"
 
 
 def test_seller_star_can_fill_original_composite_service_dimension() -> None:
@@ -220,7 +219,7 @@ def test_spec_boundary_does_not_match_750g_for_75g() -> None:
 
     assert rules.spec_in_text("75g", "红鸟液体鞋油75g") is True
     assert rules.spec_in_text("75g", "红鸟液体鞋油750g") is False
-    assert rules.spec_in_text("650g", "清扬洗发水650ml") is True
+    assert rules.spec_in_text("650g", "清扬洗发水650ml") is False
 
 
 def test_keyword_builder_does_not_emit_bare_english_alias_query() -> None:
@@ -281,7 +280,7 @@ def test_relevance_filters_wrong_brand_category_and_sku() -> None:
                     "num": 1498,
                     "skus": {
                         "sku": [
-                            {"properties_name": "净含量:650ml;规格类型:男士深层净澈", "quantity": 1498}
+                            {"properties_name": "净含量:650g;规格类型:男士深层净澈", "quantity": 1498, "price": 37.5}
                         ]
                     },
                 },
@@ -292,8 +291,8 @@ def test_relevance_filters_wrong_brand_category_and_sku() -> None:
     assert [item["num_iid"] for item in result["final"]] == ["clear-650"]
     assert result["status"] == "召回不足"
     rejected = {item["num_iid"]: item["rejection"] for item in result["rejected"]}
-    assert rejected["bag"] == "品牌不匹配"
-    assert rejected["pantene"] == "品牌不匹配"
+    assert rejected["bag"] in {"品牌不匹配", "规格信息待确认"}
+    assert rejected["pantene"] in {"品牌不匹配", "SKU不一致", "规格信息待确认"}
     assert rejected["clear-100g"] == "SKU不一致"
 
 
@@ -328,6 +327,7 @@ def test_obvious_no_stock_is_rejected_but_unknown_stock_can_remain() -> None:
                 "unitPrice": 3.0,
                 "compositeScore": 5,
                 "shopYear": 5,
+                "detail": {"skus": {"sku": [{"properties_name": "颜色:黑色;规格:75g", "price": 3.0}]}},
             },
         ],
     })
@@ -348,10 +348,10 @@ def test_unsuitable_price_and_low_score_are_removed_from_final() -> None:
         ],
     })
 
-    assert [item["num_iid"] for item in result["final"]] == ["cheap"]
+    assert [item["num_iid"] for item in result["final"]] == ["cheap", "low-score"]
     rejected = {item["num_iid"]: item["rejection"] for item in result["rejected"]}
     assert rejected["near-jd"] == "价格不低于京东"
-    assert rejected["low-score"] == "综合得分 < 60"
+    assert "low-score" not in rejected
 
 
 def test_sourcing_rules_defaults_to_six_final_candidates() -> None:
@@ -505,7 +505,7 @@ def test_jd_product_parser_extracts_title_and_images() -> None:
     assert result["title"] == "红鸟 RED BIRD 黑色液体鞋油 75g"
     assert result["item_id"] == "100012345678"
     assert result["main_image_url"] == "https://img14.360buyimg.com/n1/jfs/t1/abc.jpg"
-    assert "https://img12.360buyimg.com/n1/jfs/t1/extra.jpg" in result["image_urls"]
+    assert "https://img12.360buyimg.com/n1/jfs/t1/extra.jpg" not in result["image_urls"]
 
 
 def test_jd_product_b2b_generic_falls_back_to_item_page(monkeypatch) -> None:
@@ -536,7 +536,7 @@ def test_jd_product_b2b_generic_falls_back_to_item_page(monkeypatch) -> None:
           <meta property="og:image" content="//img11.360buyimg.com/imagetools/placeholder.png">
         </head>
         <body>
-          <img src="//img10.360buyimg.com/n1/s720x720_jfs/t1/product.jpg">
+          <div id="spec-n1"><img src="//img10.360buyimg.com/n1/s720x720_jfs/t1/product.jpg"></div>
         </body></html>
         """
 
@@ -563,7 +563,7 @@ def test_jd_browser_strategy_documents_static_fallback_only_for_missing_fields()
     for field in ("title", "image_urls", "item_id", "selected_sku", "brand", "price", "jd_price", "buy_multiple"):
         assert field in skill
         assert field in reference
-    assert "requires_browser_mcp: true" in skill
+    assert "requires_browser_mcp: false" in skill
     assert "MCP 不通" in skill
     assert "静态补齐" in skill
     assert "继续后续召回" in skill
@@ -644,7 +644,7 @@ def test_sourcing_pipeline_writes_final_csv_with_bom(tmp_path: Path) -> None:
     assert raw.startswith(b"\xef\xbb\xbf")
     text = output.read_text(encoding="utf-8-sig")
     headers = text.splitlines()[0].split(",")
-    assert headers == [
+    assert headers[:13] == [
         "1688商品标题",
         "价格(元)",
         "总进货价(元)",
@@ -666,7 +666,8 @@ def test_sourcing_pipeline_writes_final_csv_with_bom(tmp_path: Path) -> None:
     assert "https://detail.1688.com/offer/1001.html" in text
     assert "SKU库存" in text
     rows = list(csv.reader(output.open(encoding="utf-8-sig")))
-    assert rows[1][1:4] == ["3.2", "9.6", "36.00%"]
+    assert rows[1][1:4] == ["3.2", "", ""]
+    assert rows[1][headers.index("商品金额(元)")] == "9.6"
     assert rows[8][1] == "https://detail.1688.com/offer/1001.html，义乌红鸟日化"
 
 

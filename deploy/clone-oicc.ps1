@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Clones open-claude-in-chrome N times into deploy/oicc-b1..bN with
@@ -9,7 +9,7 @@
          talks to its own registered native messaging host)
       4. manifest.json name renamed to "AI Chrome Assistant (b<N>)"
       5. mcp-server.js / native-host.js getPort() honors OICC_PORT env var
-      6. npm install in host/ (mcp-server.js needs its deps)
+      6. npm ci in host/ (mcp-server.js needs its deps)
 
 .PARAMETER Count
     Number of instances to create. Default: 6
@@ -19,13 +19,14 @@
     skipped for cloning, but patches are still re-applied idempotently.
 
 .PARAMETER SkipNpmInstall
-    Don't run `npm install` in host/. Useful for CI smoke tests; for real
+    Don't run `npm ci` in host/. Useful for CI smoke tests; for real
     use you need this to run at least once.
 
 .PARAMETER WhatIf
     Print what would be done without doing anything.
 #>
 param(
+    [ValidateRange(1, 6)]
     [int]$Count = 6,
     [switch]$Force,
     [switch]$SkipNpmInstall,
@@ -38,31 +39,12 @@ $ErrorActionPreference = 'Stop'
 $RepoUrl   = 'https://github.com/noemica-io/open-claude-in-chrome.git'
 $BasePort  = 18765
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$PinnedRevision = (Get-Content -LiteralPath (Join-Path $ScriptDir 'oicc-revision.txt') -Raw).Trim()
+$PatchPython = Join-Path (Split-Path $ScriptDir -Parent) '.venv\Scripts\python.exe'
 
 function Write-Action {
     param([string]$Message)
     Write-Host "[WHATIF] $Message" -ForegroundColor Cyan
-}
-
-function Update-File {
-    param(
-        [string]$Path,
-        [string]$Pattern,        # regex
-        [string]$Replacement,
-        [string]$Description
-    )
-    if (-not (Test-Path $Path)) {
-        Write-Host "    skip $Description : file missing $Path" -ForegroundColor DarkYellow
-        return
-    }
-    $content = Get-Content $Path -Raw -Encoding utf8
-    $new = $content -replace $Pattern, $Replacement
-    if ($content -eq $new) {
-        Write-Host "    $Description : already applied"
-    } else {
-        Set-Content -Path $Path -Value $new -Encoding utf8 -NoNewline
-        Write-Host "    $Description : patched"
-    }
 }
 
 for ($i = 1; $i -le $Count; $i++) {
@@ -77,10 +59,10 @@ for ($i = 1; $i -le $Count; $i++) {
         Write-Action "Would write launcher $cmdPath with OICC_PORT=$port"
         Write-Action "Would patch extension\background.js NATIVE_HOST_NAME with .b$i suffix"
         Write-Action "Would patch extension\manifest.json name -> 'AI Chrome Assistant (b$i)'"
-        Write-Action "Would patch host\mcp-server.js getPort() to honor OICC_PORT"
+        Write-Action "Would patch host\tool-runtime.js getPort() to honor OICC_PORT"
         Write-Action "Would patch host\native-host.js getPort() to honor OICC_PORT"
         if (-not $SkipNpmInstall) {
-            Write-Action "Would run 'npm install' in $instanceDir\host"
+            Write-Action "Would run 'npm ci' in $instanceDir\host"
         }
         continue
     }
@@ -91,15 +73,26 @@ for ($i = 1; $i -le $Count; $i++) {
     if (Test-Path $instanceDir) {
         if ($Force) {
             Write-Host "  Removing existing (Force)" -ForegroundColor Yellow
-            Remove-Item -Recurse -Force $instanceDir
+            $resolvedInstance = [System.IO.Path]::GetFullPath($instanceDir)
+            $expectedInstance = [System.IO.Path]::GetFullPath((Join-Path $ScriptDir "oicc-b$i"))
+            if ($resolvedInstance -ne $expectedInstance -or (Get-Item -LiteralPath $instanceDir).Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) { throw "Unsafe instance path" }
+            Remove-Item -LiteralPath $resolvedInstance -Recurse -Force
         } else {
             Write-Host "  Clone: exists, skip clone (patches still re-applied)"
         }
     }
     if (-not (Test-Path $instanceDir)) {
         Write-Host "  Cloning..."
-        git clone --depth 1 $RepoUrl $instanceDir | Out-Null
+        git clone --no-checkout --filter=blob:none $RepoUrl $instanceDir | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Clone failed' }
+        git -C $instanceDir fetch --depth 1 origin $PinnedRevision
+        if ($LASTEXITCODE -ne 0) { throw 'Pinned revision fetch failed' }
+        git -C $instanceDir checkout --detach $PinnedRevision
+        if ($LASTEXITCODE -ne 0) { throw 'Pinned revision checkout failed' }
     }
+
+    $actualRevision = (git -C $instanceDir rev-parse HEAD).Trim()
+    if ($actualRevision -ne $PinnedRevision) { throw "Existing instance uses another revision. Back it up before recreating with -Force." }
 
     # 2. config.json
     $configContent = "{`n  `"port`": $port`n}`n"
@@ -117,46 +110,22 @@ node $nodeHostRelative %*
     [System.IO.File]::WriteAllText($cmdPath, $cmdContent, [System.Text.Encoding]::ASCII)
     Write-Host "  launcher $cmdPath (OICC_PORT=$port)"
 
-    # 4. Patches
-    Write-Host "  Patches:"
-    Update-File `
-        -Path "$instanceDir\extension\background.js" `
-        -Pattern 'const NATIVE_HOST_NAME = "com\.anthropic\.open_claude_in_chrome";?' `
-        -Replacement "const NATIVE_HOST_NAME = `"com.anthropic.open_claude_in_chrome.b$i`";" `
-        -Description "background.js NATIVE_HOST_NAME -> .b$i"
+    & $PatchPython (Join-Path $ScriptDir 'patch_oicc.py') $instanceDir --instance $i
+    if ($LASTEXITCODE -ne 0) { throw 'Browser compatibility patch failed' }
 
-    Update-File `
-        -Path "$instanceDir\extension\manifest.json" `
-        -Pattern '"name": "Open Claude in Chrome"' `
-        -Replacement "`"name`": `"AI Chrome Assistant (b$i)`"" `
-        -Description "manifest.json name -> AI Chrome Assistant (b$i)"
-
-    $envHookMcp = "function getPort() {`r`n  if (process.env.OICC_PORT) {`r`n    const p = parseInt(process.env.OICC_PORT, 10);`r`n    if (!isNaN(p) && p > 0) return p;`r`n  }`r`n  const configPath ="
-    Update-File `
-        -Path "$instanceDir\host\mcp-server.js" `
-        -Pattern 'function getPort\(\) \{\r?\n  const configPath =' `
-        -Replacement $envHookMcp `
-        -Description "mcp-server.js getPort honors OICC_PORT"
-
-    $envHookNative = "function getPort() {`r`n  if (process.env.OICC_PORT) {`r`n    const p = parseInt(process.env.OICC_PORT, 10);`r`n    if (!isNaN(p) && p > 0) return p;`r`n  }`r`n  const configPath = path.join("
-    Update-File `
-        -Path "$instanceDir\host\native-host.js" `
-        -Pattern 'function getPort\(\) \{\r?\n  const configPath = path\.join\(' `
-        -Replacement $envHookNative `
-        -Description "native-host.js getPort honors OICC_PORT"
-
-    # 5. npm install
+    # 5. npm ci
     if (-not $SkipNpmInstall) {
         $hostDir = Join-Path $instanceDir 'host'
         $nodeModules = Join-Path $hostDir 'node_modules'
         if (Test-Path $nodeModules) {
             Write-Host "  npm: node_modules exists, skipping"
         } else {
-            Write-Host "  npm install in $hostDir ..."
+            Write-Host "  npm ci in $hostDir ..."
             Push-Location $hostDir
             try {
-                npm install --silent 2>&1 | Out-Null
-                Write-Host "  npm install done"
+                if (Test-Path -LiteralPath 'package-lock.json') { npm ci --silent } else { throw 'Missing npm lock file' }
+                if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+                Write-Host "  npm ci done"
             } finally {
                 Pop-Location
             }

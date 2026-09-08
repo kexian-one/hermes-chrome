@@ -24,6 +24,7 @@ class ScheduleEntry:
     # (started via config or pre-existing yaml); falls back to alert sink.
     origin_app_id: str = ""
     origin_chat_id: str = ""
+    task: str = ""
 
     def is_valid_cron(self) -> bool:
         try:
@@ -72,6 +73,7 @@ class ScheduleStore:
             created_at=str(d.get("created_at", "")),
             origin_app_id=str(d.get("origin_app_id", "")),
             origin_chat_id=str(d.get("origin_chat_id", "")),
+            task=str(d.get("task", "")),
         )
 
     def _save(self) -> None:
@@ -114,6 +116,7 @@ class ScheduleStore:
         created_by: str = "",
         origin_app_id: str = "",
         origin_chat_id: str = "",
+        task: str = "",
     ) -> ScheduleEntry:
         if not self._loaded:
             self._load()
@@ -128,6 +131,7 @@ class ScheduleStore:
             created_at=datetime.now(tz=timezone.utc).isoformat(),
             origin_app_id=origin_app_id,
             origin_chat_id=origin_chat_id,
+            task=task,
         )
         if not entry.is_valid_cron():
             raise ValueError(f"invalid cron expression: {cron!r}")

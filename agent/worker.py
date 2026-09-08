@@ -112,11 +112,13 @@ def _required_outputs_ready(label: str) -> bool:
     if not raw:
         return True
     output_dir = Path(raw)
+    from agent.artifacts import validate_sourcing_output
     try:
         return any(
             p.is_file()
             and p.suffix.lower() == ".csv"
             and not p.name.startswith(".")
+            and validate_sourcing_output(p) is not None
             for p in output_dir.iterdir()
         )
     except OSError:
@@ -263,7 +265,7 @@ async def _run_chat_loop(
                     machine_id = _resolve_machine_id()
                     proj_root_env = os.environ.get("WORKER_PROJECT_ROOT", "").strip()
                     proj_root = Path(proj_root_env) if proj_root_env else Path.cwd()
-                    result_text = execute_builtin(
+                    result_text = await asyncio.to_thread(execute_builtin,
                         tc.name, tc.arguments, proj_root,
                         machine_id=machine_id,
                         knowledge_root=_resolve_knowledge_root(),
@@ -432,6 +434,14 @@ async def run(
         mcp_server_config=multimodal_cfg.mcp_server_config,
         mcp_tool=multimodal_cfg.mcp_tool,
     )
+
+    if label == "ecom-best-source" and user_task.strip():
+        from agent.ecom_workflow import run_sourcing
+        try:
+            return await run_sourcing(config, user_task, llm, multimodal_llm)
+        finally:
+            await llm.close()
+            await multimodal_llm.close()
 
     if not requires_browser_mcp:
         log.info(

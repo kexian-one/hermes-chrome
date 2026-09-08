@@ -36,6 +36,7 @@ class MasterDispatcher(Protocol):
     configured_browser_ids: tuple[str, ...]
 
     async def restart_worker(self, worker_id: str, reply_to: ReplyTarget | None = None) -> None: ...
+    async def stop_worker(self, worker_id: str) -> bool: ...
     async def spawn_now(
         self, worker_id: str | None, skill: str,
         reply_to: ReplyTarget | None = None,
@@ -71,6 +72,12 @@ async def handle(
             return await _query_status(dispatch.args, master, machine_name)
         case Intent.RESTART_WORKER:
             return await _restart_worker(dispatch.args, master, machine_name, reply_to)
+        case Intent.STOP_WORKER:
+            worker_id = str(dispatch.args.get("worker_id") or "")
+            if not _WORKER_RE.fullmatch(worker_id):
+                return error_card("停止失败", "需要指定 b1-b6")
+            stopped = await master.stop_worker(worker_id)
+            return info_card("停止任务", f"{worker_id} 已发送停止请求" if stopped else f"{worker_id} 没有正在运行的任务")
         case Intent.QUERY_LOGS:
             return _query_logs(dispatch.args, master, machine_name)
         case Intent.QUERY_STATS:
@@ -391,6 +398,7 @@ def _schedule_add(
         entry = master.schedule_store.add(
             cron, worker_id, skill, created_by,
             origin_app_id=origin_app_id, origin_chat_id=origin_chat_id,
+            task=str(args.get("task") or ""),
         )
     except ValueError as e:
         return error_card(f"[{machine_name}] cron 表达式无效", str(e))

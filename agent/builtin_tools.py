@@ -553,8 +553,38 @@ _JD_BROWSER_EXTRACT_JS = r"""
     (text.match(/商品编码[:：]\s*(\d{6,})/) || [])[1] ||
     (html.match(/(?:skuId|wareId|itemId|productId)["']?\s*[:=]\s*["']?(\d{6,})/i) || [])[1] ||
     '';
+  const skuFromUrl = value => (String(value || '').match(/(?:goods-detail\/|item\.jd\.com\/|item\.m\.jd\.com\/product\/|[?&](?:sku|skuId|wareId)=)(\d+)/i) || [])[1] || '';
+  const skuIds = product => {
+    if (!product || typeof product !== 'object') return [];
+    const ids = [product.sku, product.skuId, product.skuid].filter(id => /^\d+$/.test(String(id ?? ''))).map(String);
+    if (!ids.length && /^\d+$/.test(String(product.productID ?? ''))) ids.push(String(product.productID));
+    for (const value of [product.url, product['@id']]) {
+      const id = skuFromUrl(value);
+      if (id) ids.push(id);
+    }
+    return [...new Set(ids)];
+  };
+  const pageIds = [
+    ...skuIds(window.pageConfig?.product),
+    skuFromUrl(document.querySelector('link[rel="canonical"]')?.href),
+    skuFromUrl(document.querySelector('meta[property="og:url"]')?.content),
+  ].filter(Boolean);
+  const identityConflict = Boolean(itemId && pageIds.some(id => id !== itemId));
+  const stateCandidates = [];
+  if (window.pageConfig?.product) stateCandidates.push(window.pageConfig.product);
+  for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+    try {
+      const value = JSON.parse(script.textContent);
+      stateCandidates.push(...(Array.isArray(value) ? value : value['@graph'] || [value]));
+    } catch (_) {}
+  }
+  const state = !identityConflict && stateCandidates.find(p => {
+    const ids = skuIds(p);
+    return ids.length > 0 && ids.every(id => id === itemId);
+  }) || {};
   const title = clean(
     document.querySelector('h1')?.innerText ||
+    state.name ||
     document.querySelector('[class*=goods][class*=title]')?.innerText ||
     document.querySelector('[class*=title]')?.innerText ||
     document.title
@@ -565,31 +595,39 @@ _JD_BROWSER_EXTRACT_JS = r"""
     clean(document.querySelector('.num1')?.innerText) ||
     clean((text.match(/采购价\s*[¥￥]?\s*[0-9]+(?:\.[0-9]+)?/) || [])[0]);
   const priceMatch = priceText.match(/[0-9]+(?:\.[0-9]+)?/);
-  const price = priceMatch ? Number(priceMatch[0]) : null;
+  const offerPrice = !Array.isArray(state.offers) && state.offers?.price;
+  const price = priceMatch && !/[-~～至]|询价/.test(priceText) ? Number(priceMatch[0]) :
+    /^\d+(\.\d+)?$/.test(String(offerPrice)) ? Number(offerPrice) : null;
   const brand =
     clean((text.match(/品牌[:：]\s*([^ 商品编码规格参数]{1,30})/) || [])[1]) ||
-    clean(document.querySelector('[class*=brand]')?.innerText).replace(/^品牌[:：]?/, '');
+    clean(document.querySelector('[class*=brand]')?.innerText).replace(/^品牌[:：]?/, '') ||
+    clean(typeof state.brand === 'string' ? state.brand : state.brand?.name);
   const shopName =
     clean(document.querySelector('[class*=shop][class*=name]')?.innerText) ||
     clean((text.match(/([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40}(?:专营店|旗舰店|官方店|店铺|超市|商行|贸易|百货店))/) || [])[1]);
   const stockText = clean((text.match(/(现货[^，。 ]{0,30}|有货[^，。 ]{0,30}|无货[^，。 ]{0,30}|预计[^，。 ]{0,30}发货)/) || [])[1]);
   const freightText = clean((text.match(/((?:实付|满|不满|免运费|运费)[^。；\n]{0,80}(?:免运费|运费|元))/) || [])[1]);
   const buyMultiple = Number((text.match(/(?:起订|起批|最小起购|起购)[^0-9]{0,8}(\d+)/) || [])[1] || '') || null;
-  const selectedSku =
-    clean(document.querySelector('[class*=sku] [class*=selected]')?.innerText) ||
-    clean((title.match(/(\d+\s*(?:g|克|kg|千克|ml|mL|毫升|枚|只|瓶|盒|袋)[^，, ]*)/) || [])[1]);
-  const allImages = [...document.images]
+  const selectedSku = [...document.querySelectorAll('[class*=sku] [class*=selected], [class*=sku] [aria-checked=true], #choose-attrs .selected')].filter(visible).map(el => clean(el.innerText)).filter(Boolean).join('; ');
+  const productImages = [...document.querySelectorAll('#spec-n1 img, #spec-list img, [class*=goodsdetail] [class*=image] img, [class*=gallery] img, [class*=preview] img')]
+    .filter(img => !img.closest('[class*=recommend], [class*=Recommend], [class*=suggest], [class*=猜你喜欢]'));
+  const ogImage = document.querySelector('meta[property="og:image"]')?.content;
+  const allImages = productImages
     .map((img) => img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-img') || img.getAttribute('data-original'))
     .filter(Boolean)
     .map((src) => src.startsWith('//') ? location.protocol + src : src);
-  const imageUrls = [...new Set(allImages)]
-    .filter((src) => /360buyimg|jdimg|m\.360buyimg/.test(src))
-    .filter((src) => !/imagetools|logo|n-header|blank|gif/i.test(src))
-    .slice(0, 30);
-  const mainImageUrl =
-    imageUrls.find((src) => /\/n1\/|s800x800|m\.360buyimg\.com\/n1/.test(src)) ||
-    imageUrls[0] ||
-    '';
+  const normalizeImages = values => [...new Set(values.map(value => typeof value === 'string' ? value : value?.contentUrl || value?.url)
+    .filter(Boolean).map(src => src.startsWith('//') ? location.protocol + src : src))]
+    .filter(src => {
+      try {
+        const parsed = new URL(src);
+        return /^https?:$/.test(parsed.protocol) && /(^|\.)(360buyimg\.com|jdimg\.com)$/.test(parsed.hostname);
+      } catch (_) { return false; }
+    }).filter(src => !/imagetools|logo|n-header|blank|\.gif(?:[?!]|$)/i.test(src)).slice(0, 30);
+  const stateImages = normalizeImages(Array.isArray(state.image) ? state.image : state.image ? [state.image] : []);
+  const imageUrls = identityConflict ? [] : stateImages.length ? stateImages : normalizeImages([...allImages, ...(ogImage ? [ogImage] : [])]);
+  const imageScope = identityConflict ? 'unconfirmed' : stateImages.length ? 'selected_sku' : 'product_page';
+  const mainImageUrl = imageUrls[0] || '';
   const scoreMatches = [...text.matchAll(/(物流|售后|商品|服务)\s*([0-9](?:\.[0-9])?)/g)]
     .slice(0, 10)
     .map((m) => `${m[1]}${m[2]}`);
@@ -605,6 +643,19 @@ _JD_BROWSER_EXTRACT_JS = r"""
     price_text: priceText,
     main_image_url: mainImageUrl,
     image_urls: imageUrls,
+    image_urls_scope: imageScope,
+    image_evidence: imageUrls.map(image => ({url: image, item_id: itemId, source: stateImages.length ? 'sku_state' : 'product_gallery'})),
+    target_errors: identityConflict ? ['京东页面实际商品 ID 与请求 SKU 不一致'] : [],
+    identifiers: identityConflict ? [] : ['barcode', 'gtin', 'gtin8', 'gtin12', 'gtin13', 'gtin14', 'ean', 'upc']
+      .filter(key => typeof state[key] === 'string' || typeof state[key] === 'number')
+      .map(key => ({value: String(state[key]), evidence: String(state[key]), level: state.barcode_level || state.gtin_level || state.identifier_level || state.barcode_scope || state.gtin_scope || state.identifier_scope || 'unknown', source: 'jd_sku_state.' + key})),
+    readiness: {
+      document_ready: ['interactive', 'complete'].includes(document.readyState),
+      loading: [...document.querySelectorAll('[class*=goodsdetail] [aria-busy="true"], [class*=goodsdetail] [class*=skeleton]')].some(visible),
+      sku_bound: skuIds(state).length > 0,
+      sku_option_count: document.querySelectorAll('#choose-attrs .item, [class*=sku] [role="radio"], [class*=sku] [class*=option]').length,
+      price_unavailable: /询价|暂无报价|暂无价格|登录后.*价格|登录可见/.test(priceText),
+    },
     shop_name: shopName,
     stock_text: stockText,
     freight_text: freightText,
@@ -614,6 +665,17 @@ _JD_BROWSER_EXTRACT_JS = r"""
   });
 })()
 """
+
+
+def _jd_product_ready(product: dict, stable_count: int) -> bool:
+    if product.get("target_errors") or not all(product.get(key) for key in ("title", "item_id", "main_image_url")):
+        return False
+    if product.get("selected_sku") and product.get("price"):
+        return True
+    readiness = product.get("readiness") or {}
+    if not readiness.get("document_ready") or readiness.get("loading") or stable_count < 2:
+        return False
+    return bool(product.get("selected_sku") or readiness.get("sku_bound") or readiness.get("sku_option_count") == 0)
 
 
 async def _extract_jd_product_browser(args: dict, project_root: Path, *, mcp: Any) -> str:
@@ -669,22 +731,34 @@ async def _extract_jd_product_browser(args: dict, project_root: Path, *, mcp: An
                     "context": _truncate_text(navigate_text, 2000),
                 }
             else:
-                await asyncio.sleep(wait_seconds)
-                js_text = await _mcp_call_text(
-                    mcp,
-                    "javascript_tool",
-                    {"action": "javascript_exec", "tabId": tab_id, "text": _JD_BROWSER_EXTRACT_JS},
-                )
-                product = _decode_javascript_payload(js_text)
+                product = {}
+                previous_fields = None
+                stable_count = 0
+                for _poll in range(wait_seconds):
+                    js_text = await _mcp_call_text(mcp, "javascript_tool", {"action": "javascript_exec", "tabId": tab_id, "text": _JD_BROWSER_EXTRACT_JS})
+                    product = _decode_javascript_payload(js_text)
+                    if isinstance(product, dict) and product.get("target_errors"):
+                        raise ValueError("京东页面实际商品 ID 与请求 SKU 不一致")
+                    if isinstance(product, dict):
+                        current_fields = tuple(str(product.get(key) or "") for key in ("title", "item_id", "main_image_url", "selected_sku", "price"))
+                        stable_count = stable_count + 1 if current_fields == previous_fields else 0
+                        previous_fields = current_fields
+                        if _jd_product_ready(product, stable_count):
+                            product["extraction_polls"] = _poll + 1
+                            break
+                    await asyncio.sleep(1)
                 if not isinstance(product, dict):
                     product = {"raw": product}
 
+                requested_id = _jd_sku_id_from_url(requested_url)
+                if product.get("item_id") and str(product["item_id"]) != requested_id:
+                    raise ValueError("京东页面返回了不同商品 ID")
                 product.setdefault("source", "browser_mcp")
                 product["jd_url"] = product.get("jd_url") or b2b_url
                 product["b2b_url"] = b2b_url
                 product["requested_url"] = requested_url
                 product["item_id"] = product.get("item_id") or _jd_sku_id_from_url(requested_url)
-                if product.get("price") is None and isinstance(product.get("price_text"), str):
+                if product.get("price") is None and isinstance(product.get("price_text"), str) and not re.search(r"[-~～至]|询价", product["price_text"]):
                     match = re.search(r"[0-9]+(?:\.[0-9]+)?", product["price_text"])
                     if match:
                         product["price"] = float(match.group(0))
@@ -693,7 +767,7 @@ async def _extract_jd_product_browser(args: dict, project_root: Path, *, mcp: An
                     product["image_urls"] = [product["main_image_url"]]
 
                 missing = [
-                    field for field in ("title", "item_id", "main_image_url", "price")
+                    field for field in ("title", "item_id", "main_image_url", "price", "selected_sku", "brand")
                     if not product.get(field)
                 ]
 

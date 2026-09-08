@@ -7,30 +7,13 @@ JD/B2B 商品信息的第一来源是当前 worker 连接的 OICC 浏览器页�
 1. 使用运行时注入的 MCP 浏览器工具，不手动指定端口、不连接其他 worker 的浏览器。
 2. 从用户原始 URL 提取 `skuId`。无论用户给 `item.jd.com/<skuId>.html`，还是 `b2b.jd.com/goods/goods-detail/<skuId>`，实际打开都统一使用 `https://b2b.jd.com/goods/goods-detail/<skuId>?sourceurl=/trade/goods-detail&bMallTag=1&buId=456`。
 3. 先调用 `tabs_context_mcp` 检查当前 MCP tab group；需要新页面时调用 `tabs_create_mcp` 创建临时 tab。没有 tab group 时可 `tabs_context_mcp(createIfEmpty=true)` 创建。
-4. 调用 `navigate` 必须带临时 `tabId` 和统一后的 B2B URL。调用 `javascript_tool` 必须带 `action: "javascript_exec"`、同一个 `tabId` 和 JS 表达式。
-5. 在同一个页面里用 JS 一次性提取这些字段:
-   - `title`
-   - `jd_url`
-   - `item_id`
-   - `main_image_url`
-   - `image_urls`
-   - `brand`
-   - `selected_sku`
-   - `price` 和 `jd_price`
-   - `buy_multiple`
-6. 将浏览器结果写入临时 `jd_product.json`，字段缺失时再运行 `jd_product.py`。
-7. 操作结束后调用 `tabs_close_mcp` 关闭临时 tab，避免长期运行时 tab 越积越多。
-8. 合并静态脚本结果时只补空字段，不覆盖浏览器登录态字段。
+4. 调用 `navigate` 带临时 `tabId`，调用 `javascript_tool` 带 `action: javascript_exec` 和同一个 tabId。
+5. 在当前页面一次提取 `title`、`image_urls`、`item_id`、`selected_sku`、`brand`、`price`、`jd_price`、`buy_multiple`。
+6. 缺失字段用静态脚本补齐，不覆盖浏览器登录态字段。临时tab在finally中关闭。
 
-## 页面读取建议
+## 页面读取
 
-用 `javascript_tool` 读取页面数据，优先级如下:
-
-1. 页面内全局状态对象，如 `window.__INITIAL_STATE__`、`window.__PRELOADED_STATE__`、`window.pageConfig`。
-2. JSON-LD、`og:title`、`og:image`、商品图片脚本变量。
-3. 可见 DOM 中的标题、价格、已选规格、品牌、起购倍数。
-
-不要截图猜商品标题、价格或 SKU。截图只用于判断登录、验证码、滑块、风控页或页面布局。
+优先当前已选SKU的可见DOM，补充window.pageConfig.product和JSON-LD中ID与当前商品一致的对象。不遍历无关商品状态。当前商品图库主图优先，状态/OG图片补充。商品图片理解核对包装标签，不代替价格、库存、MOQ。
 
 ## 字段口径
 

@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import os
 import re
+import time
+import hashlib
+from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from keyword_builder import build_keywords
 from sourcing_rules import run_pipeline
+from product_match import relevance, target_attributes, sku_rows
+from runtime_support import atomic_json, parallel_map, refresh_details, remaining_timeout
+from data_sources import release_data_client
+from supplier_identity import supplier_key
+from sourcing_feedback import export_feedback
+from sourcing_costs import STATUS_LABELS
 
 
 CSV_HEADERS = [
@@ -27,6 +37,9 @@ CSV_HEADERS = [
     "经营年限",
     "风险说明",
     "1688链接",
+    "匹配状态", "匹配SKU", "SKU ID", "目标规格", "候选规格", "差异原因", "目标图片", "SKU图片", "采购SKU数量", "图片核验",
+    "可购状态", "商品金额(元)", "订单运费(元)", "额外税费(元)", "已确认优惠(元)", "到货总成本(元)", "到货单位成本(元)", "销售单位", "收货地区", "成本待确认项", "成本依据", "利润口径",
+    "目标条码", "货源条码", "条码核验",
 ]
 
 
@@ -40,6 +53,7 @@ def run_from_files(
     known_brand: str | None = None,
     buy_multiple: int | None = None,
     target_count: int = 6,
+    confirm_details: bool = True,
 ) -> dict[str, Any]:
     payload = _load_pipeline_payload(
         jd_product_path=jd_product_path,
@@ -49,99 +63,104 @@ def run_from_files(
         buy_multiple=buy_multiple,
         target_count=target_count,
     )
-    result = _run_with_final_detail_confirmation(payload, target_count)
+    result = _run_with_final_detail_confirmation(payload, target_count) if confirm_details else run_pipeline(payload)
+    if payload.get("retrieval"):
+        result["retrieval"] = payload["retrieval"]
+    if payload.get("partial") or result.get("pending") or (result.get("confirmation") or {}).get("errors") or (result.get("confirmation") or {}).get("error"):
+        result["status"] = "部分完成"
     csv_path = _resolve_output_path(
         output_path or _default_csv_name(result.get("target") or {}),
         csv_visible=True,
     )
     write_csv(result, csv_path)
+    feedback = export_feedback(result, csv_path.with_name(csv_path.stem + "-反馈.csv"))
 
     if json_output_path:
         json_path = _resolve_output_path(json_output_path, csv_visible=False)
         json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    return {
+    summary = {
         "status": result.get("status"),
         "final_count": len(result.get("final") or []),
         "csv_path": str(csv_path),
         "json_path": str(_resolve_output_path(json_output_path, csv_visible=False)) if json_output_path else "",
         "confirmation": result.get("confirmation") or {},
         "top3": [_summary_item(item) for item in (result.get("final") or [])[:3]],
+        "pending_count": len(result.get("pending") or []),
+        "schema_version": 2,
+        "csv_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+        "completed_at": time.time(),
+        "retrieval": result.get("retrieval") or {},
+        "feedback_path": feedback["feedback_path"],
+        "feedback_snapshot_path": feedback["snapshot_path"],
+        "confirmed_purchase_count": (result.get("stats") or {}).get("confirmed_purchase_count", 0),
+        "pending_purchase_count": (result.get("stats") or {}).get("pending_purchase_count", 0),
     }
+    atomic_json(csv_path.with_suffix(".manifest.json"), summary)
+    return summary
 
 
-def _run_with_final_detail_confirmation(
-    payload: dict[str, Any],
-    target_count: int,
-    max_confirmations: int | None = None,
-) -> dict[str, Any]:
-    candidates = payload.get("candidates")
-    if not isinstance(candidates, list) or not candidates:
+def _run_with_final_detail_confirmation(payload: dict[str, Any], target_count: int, max_confirmations: int | None = None, *, force_refresh: bool = False) -> dict[str, Any]:
+    candidates = payload.get("candidates") or []
+    maximum = max_confirmations or max(target_count * 4, 12)
+    ranked = sorted(candidates, key=lambda item: relevance(item, payload.get("target") or {}), reverse=True)
+    pending = [c for c in ranked if force_refresh or _needs_detail_confirmation(c)][:maximum]
+    if not pending:
         return run_pipeline(payload)
-
-    max_confirmations = max_confirmations or max(target_count * 4, 10)
-    attempted: set[str] = set()
-    confirmed = 0
-    errors: list[str] = []
-    client = None
-
-    result = run_pipeline(payload)
-    while confirmed < max_confirmations:
-        final = result.get("final") or []
-        to_confirm: list[dict[str, Any]] = []
-        for item in final:
-            num_iid = str(item.get("num_iid") or "")
-            if not num_iid or num_iid in attempted:
-                continue
-            source = _candidate_by_num_iid(candidates, num_iid)
-            if source is not None and _needs_detail_confirmation(source):
-                to_confirm.append(source)
-        if not to_confirm:
-            break
-
-        if client is None:
-            try:
-                client = _make_data_client()
-            except Exception as exc:
-                result["confirmation"] = {
-                    "enabled": False,
-                    "confirmed": confirmed,
-                    "error": str(exc)[:200],
-                }
-                return result
-
-        changed = False
-        for candidate in to_confirm:
-            num_iid = str(candidate.get("num_iid") or "")
-            attempted.add(num_iid)
-            try:
-                detail = client.item_get(num_iid)
-            except Exception as exc:
-                errors.append(f"{num_iid}: {type(exc).__name__}: {str(exc)[:120]}")
-                continue
-            if isinstance(detail, dict) and detail:
-                _enrich_detail_seller_info(client, detail, errors)
-                _merge_confirmed_detail(candidate, detail)
-                confirmed += 1
-                changed = True
-            if confirmed >= max_confirmations:
-                break
-        if not changed:
-            break
+    try:
+        client = _make_data_client()
+    except Exception as exc:
+        for candidate in pending:
+            candidate["detail_error"] = type(exc).__name__
         result = run_pipeline(payload)
+        result["confirmation"] = {"enabled": False, "error": type(exc).__name__, "confirmed": 0}
+        return result
+    errors = []
+    def enrich(offer_id: str) -> tuple[dict, list]:
+        detail = copy.deepcopy(client.item_get(offer_id))
+        if not detail:
+            raise ValueError("empty detail")
+        if not detail.get("fetched_at"):
+            detail["fetched_at"] = time.time()
+        detail_errors = []
+        _enrich_detail_seller_info(client, detail, detail_errors)
+        return detail, detail_errors
+    refresh_context = refresh_details.set(force_refresh)
+    try:
+        runtime = getattr(getattr(client, "cfg", None), "runtime", {})
+        offer_ids = [str(candidate.get("num_iid") or candidate.get("offerId") or "") for candidate in pending]
+        outcomes = parallel_map(offer_ids, enrich, concurrency=int(runtime.get("concurrency", 3)), timeout=float(runtime.get("detail_timeout_seconds", 120)))
+        for candidate, outcome in zip(pending, outcomes):
+            remaining_timeout(1)
+            if outcome["ok"]:
+                detail, detail_errors = outcome["value"]
+                _merge_confirmed_detail(candidate, detail)
+                errors.extend(detail_errors)
+            else:
+                candidate["detail_error"] = outcome["error"]
+        errors.extend({"offer_id": c.get("num_iid"), "error": r["error"]} for c, r in zip(pending, outcomes) if not r["ok"])
+        result = run_pipeline(payload)
+        result["confirmation"] = {"enabled": True, "attempted": len(pending), "confirmed": sum(r["ok"] for r in outcomes), "errors": errors, "api_stats": getattr(client, "stats", {})}
+        return result
+    finally:
+        refresh_details.reset(refresh_context)
+        release_data_client(client)
 
-    if client is not None:
-        try:
-            client.close()
-        except Exception:
-            pass
-    result["confirmation"] = {
-        "enabled": True,
-        "confirmed": confirmed,
-        "attempted": len(attempted),
-        "errors": errors[:5],
-    }
-    return result
+
+def select_confirmation_batch(candidates: list[dict[str, Any]], target: dict[str, Any], limit: int = 10, per_supplier: int = 2, supplier_attempts: dict[str, int] | None = None) -> list[dict[str, Any]]:
+    attempts = supplier_attempts or {}
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for candidate in sorted(candidates, key=lambda item: relevance(item, target), reverse=True):
+        groups.setdefault(supplier_key(candidate), []).append(candidate)
+    ordered = sorted(groups, key=lambda key: (attempts.get(key, 0), -relevance(groups[key][0], target)))
+    selected = []
+    for offset in range(max(1, per_supplier)):
+        for key in ordered:
+            if offset < len(groups[key]):
+                selected.append(groups[key][offset])
+                if len(selected) >= max(1, limit):
+                    return selected
+    return selected
 
 
 def _candidate_by_num_iid(candidates: list[dict[str, Any]], num_iid: str) -> dict[str, Any] | None:
@@ -156,6 +175,8 @@ def _candidate_by_num_iid(candidates: list[dict[str, Any]], num_iid: str) -> dic
 def _needs_detail_confirmation(candidate: dict[str, Any]) -> bool:
     detail = candidate.get("detail") if isinstance(candidate.get("detail"), dict) else {}
     if not detail:
+        return True
+    if detail.get("fetched_at") is not None and time.time() - float(detail["fetched_at"]) > 60:
         return True
     if not _has_shop_score_and_year(candidate):
         return True
@@ -231,6 +252,32 @@ def _shop_year_value(item: dict[str, Any]) -> Any:
 
 
 def _merge_confirmed_detail(candidate: dict[str, Any], detail: dict[str, Any]) -> None:
+    previous = candidate.get("detail") or {}
+    old_rows, new_rows = sku_rows(previous), sku_rows(detail)
+    title = detail.get("title") or candidate.get("title")
+    for index, row in enumerate(new_rows):
+        row_id = str(row.get("sku_id") or row.get("skuId") or "")
+        old = next((r for r in old_rows if row_id and str(r.get("sku_id") or r.get("skuId") or "") == row_id), None)
+        if old is None and len(new_rows) == len(old_rows) == 1:
+            old = old_rows[0]
+        if old is None:
+            continue
+        # Price and inventory may change without invalidating image evidence.
+        def identity(r: dict, props: object, product_title: object) -> str:
+            api_identifiers = [entry for entry in (r.get("identifiers") or []) if isinstance(entry, dict) and not str(entry.get("source") or "").startswith("image:")]
+            fields = {"sku_id", "skuId", "properties_name", "name", "skuName", "sku_image_url", "sku_image_urls", "image_urls", "image", "pic_url", "attributes", "barcode", "gtin", "gtin8", "gtin12", "gtin13", "gtin14", "ean", "upc", "barcode_level", "gtin_level", "identifier_level", "barcode_scope", "gtin_scope", "identifier_scope"}
+            return json.dumps([product_title, props, {k: v for k, v in r.items() if k in fields}, api_identifiers], sort_keys=True, ensure_ascii=False)
+        if identity(old, previous.get("props"), candidate.get("title")) == identity(row, detail.get("props"), title):
+            for key in ("vision", "vision_attributes"):
+                if key in old:
+                    row[key] = old[key]
+            image_identifiers = [entry for entry in (old.get("identifiers") or []) if isinstance(entry, dict) and str(entry.get("source") or "").startswith("image:")]
+            if image_identifiers:
+                entries = [*(row.get("identifiers") or []), *image_identifiers]
+                row["identifiers"] = list({json.dumps(entry, sort_keys=True, ensure_ascii=False): entry for entry in entries}.values())
+    candidate.pop("detail_error", None)
+    if title:
+        candidate["title"] = title
     candidate["detail"] = detail
     for src_key, dst_key in (
         ("min_num", "MOQ"),
@@ -281,7 +328,7 @@ def _load_pipeline_payload(
         raise ValueError("JD product input is missing title")
 
     product_brand = known_brand or _string_or_none(product.get("brand"))
-    kw = build_keywords(title, product_brand)
+    kw = build_keywords(title + " " + str(product.get("selected_sku") or ""), product_brand)
     image_urls = _image_urls(product)
     target = kw.to_target(
         title,
@@ -292,6 +339,10 @@ def _load_pipeline_payload(
         selected_sku=product.get("selected_sku") or product.get("skuName") or product.get("sku_name") or "",
         jd_price=product.get("jd_price") or product.get("price") or "",
     )
+    for key in ("attributes", "user_attributes", "allow_pack_substitution", "require_vision", "target_errors", "unconfirmed_attributes", "vision", "destination", "jd_price_tax_included"):
+        if key in product:
+            target[key] = product[key]
+    target["attributes"] = target_attributes(target)
     if buy_multiple is not None:
         target["buy_multiple"] = buy_multiple
     elif product.get("buy_multiple") is not None:
@@ -318,17 +369,22 @@ def write_csv(result: dict[str, Any], output_path: Path) -> None:
             writer.writerow({})
             row_num += 1
         writer.writerow({CSV_HEADERS[1]: _safe_cell(_b9_summary_text(result))})
+        for idx, item in enumerate((result.get("pending") or [])[:6]):
+            writer.writerow(_csv_row(idx, item, target))
 
 
 def _csv_row(rank: int, item: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
     del rank
     price = _first_number(item, "unitPrice", "unit_price", "price")
     quantity = _target_quantity(target)
-    purchase_total = price * quantity if price is not None and quantity > 0 else None
+    selected = item.get("selected_sku") or {}
+    purchase = item.get("purchase") or selected.get("purchase") or {}
+    components = purchase.get("components") or {}
+    purchase_total = purchase.get("landed_total")
     jd_price = _first_number(target, "jd_price", "jdPrice", "price")
     jd_total = jd_price * quantity if jd_price is not None and quantity > 0 else None
-    profit_rate = _profit_rate(jd_total, purchase_total)
-    moq = _first_value(item, "MOQ", "moq", "minOrderQuantity")
+    profit_rate = _profit_rate(jd_total, purchase_total) if target.get("jd_price_tax_included") is True else None
+    moq = selected.get("moq") if selected else _first_value(item, "MOQ", "moq", "minOrderQuantity")
     service = _service_score_value(item)
     shop_year = _shop_year_value(item)
     return {
@@ -342,9 +398,34 @@ def _csv_row(rank: int, item: dict[str, Any], target: dict[str, Any]) -> dict[st
         "SKU库存": _safe_cell(_stock_text(item)),
         "店铺信息": _safe_cell(_shop_text(item)),
         "综合服务分": _format_number(service),
-        "经营年限": shop_year or "",
+        "经营年限": _format_number(_to_float(shop_year)),
         "风险说明": _safe_cell(_risk_text(item)),
         "1688链接": _safe_cell(str(item.get("link") or item.get("detail_url") or "")),
+        "匹配状态": "合格" if not item.get("rejection") else "待确认",
+        "匹配SKU": _safe_cell(str(selected.get("sku_name") or "")),
+        "SKU ID": _safe_cell(str(selected.get("sku_id") or "")),
+        "目标规格": _safe_cell(json.dumps(target_attributes(target), ensure_ascii=False)),
+        "候选规格": _safe_cell(json.dumps(selected.get("attributes") or {}, ensure_ascii=False)),
+        "差异原因": _safe_cell(json.dumps(item.get("match_evidence") or {}, ensure_ascii=False)),
+        "目标图片": _safe_cell(str(target.get("main_image_url") or "")),
+        "SKU图片": _safe_cell(str(selected.get("sku_image_url") or "")),
+        "采购SKU数量": selected.get("order_quantity", ""),
+        "图片核验": _safe_cell(str((selected.get("vision") or {}).get("status") or "未核验")),
+        "可购状态": STATUS_LABELS.get(purchase.get("status"), "可购性待确认"),
+        "商品金额(元)": _format_number(components.get("merchandise")),
+        "订单运费(元)": _format_number(components.get("shipping")),
+        "额外税费(元)": _format_number(components.get("tax")),
+        "已确认优惠(元)": _format_number(components.get("discount")),
+        "到货总成本(元)": _format_number(purchase_total),
+        "到货单位成本(元)": _format_number(purchase.get("landed_unit")),
+        "销售单位": _safe_cell(str(purchase.get("sales_unit") or "待确认")),
+        "收货地区": _safe_cell(json.dumps(target.get("destination"), ensure_ascii=False) if target.get("destination") else "待确认"),
+        "成本待确认项": _safe_cell("；".join(purchase.get("missing") or [])),
+        "成本依据": _safe_cell(json.dumps(purchase.get("evidence") or {}, ensure_ascii=False)),
+        "利润口径": "京东含税参考售价与到货采购成本差额；未含销售平台费用" if profit_rate is not None else "成本或京东售价含税口径待确认",
+        "目标条码": _safe_cell(json.dumps(selected.get("target_identifiers") or [], ensure_ascii=False)),
+        "货源条码": _safe_cell(json.dumps(selected.get("identifiers") or [], ensure_ascii=False)),
+        "条码核验": {"matched": "同层级一致", "conflict": "冲突待核实"}.get((selected.get("identifier_comparison") or {}).get("status"), "未确认"),
     }
 
 
@@ -365,6 +446,7 @@ def _profit_rate(jd_total: float | None, purchase_total: float | None) -> float 
 
 
 def _summary_item(item: dict[str, Any]) -> dict[str, Any]:
+    purchase = item.get("purchase") or {}
     return {
         "title": str(item.get("title") or ""),
         "shop": _shop_text(item),
@@ -374,6 +456,11 @@ def _summary_item(item: dict[str, Any]) -> dict[str, Any]:
         "stock": _stock_text(item),
         "link": str(item.get("link") or item.get("detail_url") or ""),
         "risk": _risk_text(item),
+        "purchase_status": purchase.get("status", "pending"),
+        "purchase_label": STATUS_LABELS.get(purchase.get("status"), "可购性待确认"),
+        "landed_total": purchase.get("landed_total"),
+        "landed_unit": purchase.get("landed_unit"),
+        "cost_pending": purchase.get("missing") or [],
     }
 
 
@@ -426,6 +513,12 @@ def _shop_text(item: dict[str, Any]) -> str:
 
 
 def _shipping_text(item: dict[str, Any]) -> str:
+    purchase = item.get("purchase")
+    if isinstance(purchase, dict):
+        shipping = (purchase.get("components") or {}).get("shipping")
+        if shipping is not None:
+            return "包邮" if shipping == 0 else _format_number(shipping)
+        return "；".join(text for text in purchase.get("missing") or [] if any(key in text for key in ("运费", "免邮", "地区"))) or "订单运费待确认"
     detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
     freight = detail.get("freightInfo") if isinstance(detail.get("freightInfo"), dict) else {}
     free_signals = [
@@ -481,6 +574,9 @@ def _truthy_shipping_free(value: Any) -> bool:
 
 
 def _stock_text(item: dict[str, Any]) -> str:
+    selected = item.get("selected_sku")
+    if isinstance(selected, dict):
+        return f"匹配SKU库存 {selected['stock']}" if selected.get("stock") is not None else "待确认"
     detail = item.get("detail") if isinstance(item.get("detail"), dict) else {}
     sku_rows = _detail_sku_rows(detail)
     sku_name = str(item.get("skuName") or item.get("sku_name") or "")

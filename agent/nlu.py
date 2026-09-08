@@ -13,6 +13,7 @@ from agent.skill_loader import SkillRegistry
 class Intent(str, Enum):
     QUERY_STATUS = "query_status"
     RESTART_WORKER = "restart_worker"
+    STOP_WORKER = "stop_worker"
     QUERY_LOGS = "query_logs"
     QUERY_STATS = "query_stats"
     PAUSE_ALL = "pause_all"
@@ -46,6 +47,7 @@ Intents:
     "现在啥情况" / "查状态" / "worker 都活着吗" / "正在跑什么" → {} (all workers)
     "查 b3 状态" / "看下 b2" / "b3 现在咋样" / "b2 状态" → {"worker_id": "b3"} / {"worker_id": "b2"}
 - restart_worker: User wants to restart a worker. Args: {"worker_id": "bN"} (N is 1-6). Examples: "重启 worker 3" → {"worker_id": "b3"}, "b3 重启" → {"worker_id": "b3"}
+- stop_worker: Stop only the specified running worker. Args: {"worker_id": "bN"}. Examples: "停止 b2", "取消 b3 当前任务".
 - query_logs: User wants recent logs for a worker. Args: {"worker_id": "bN"}. Examples: "看 worker 3 日志", "b3 最近日志"
 - query_stats: User wants today's statistics. Examples: "今天的统计", "今天开了多少"
 - pause_all: User wants to pause all workers. Examples: "暂停所有", "停一下"
@@ -177,12 +179,29 @@ def _format_recent_context(recent_turns: list[tuple[str, str, str]]) -> str:
     return "\n".join(lines)
 
 
+def fast_route(text: str) -> IntentDispatch | None:
+    commands = {"查状态": Intent.QUERY_STATUS, "/status": Intent.QUERY_STATUS,
+                "/help": Intent.HELP, "帮助": Intent.HELP, "暂停所有": Intent.PAUSE_ALL,
+                "恢复所有": Intent.RESUME_ALL, "技能列表": Intent.SKILL_LIST,
+                "定时任务列表": Intent.SCHEDULE_LIST}
+    command = text.strip()
+    if command in commands:
+        return IntentDispatch(commands[command], {})
+    match = re.fullmatch(r"(?:停止|取消)\s*(b[1-6])(?:\s*当前任务)?", command, re.I)
+    if match:
+        return IntentDispatch(Intent.STOP_WORKER, {"worker_id": match[1].lower(), "worker_explicit": True})
+    return None
+
+
 async def route(
     text: str,
     llm: LLMClient,
     skills_dir: Path | None = None,
     recent_turns: list[tuple[str, str, str]] | None = None,
 ) -> IntentDispatch:
+    quick = fast_route(text)
+    if quick is not None:
+        return quick
     system_prompt = _build_system_prompt(skills_dir or _DEFAULT_SKILLS_DIR)
     user_content = text
     if recent_turns:
@@ -230,9 +249,12 @@ def _parse_json(raw: str) -> dict:
 
 def _recover_ecom_task_url(dispatch: IntentDispatch, source_text: str) -> None:
     """Keep JD URLs in ecom tasks even when the classifier summarizes them away."""
-    if dispatch.intent != Intent.RUN_NOW:
+    if dispatch.intent not in {Intent.RUN_NOW, Intent.SCHEDULE_ADD}:
         return
     if dispatch.args.get("skill") != "ecom-best-source":
+        return
+    if _ECOM_URL_RE.search(source_text):
+        dispatch.args["task"] = source_text.strip()
         return
     task = str(dispatch.args.get("task") or "").strip()
     if _ECOM_URL_RE.search(task) or _URL_RE.search(task):

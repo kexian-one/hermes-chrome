@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from product_match import compare_attributes, measure, select_sku, target_attributes
+from attribute_schema import brand_aliases as known_brand_aliases, category_aliases
+from supplier_identity import supplier_key
+from sourcing_costs import STATUS_LABELS
+
 
 DEFAULT_WEIGHTS = {
     "price": 5 / 7,
@@ -29,15 +34,6 @@ REMOVED_DIMENSION_FIELDS = {
     "invoice_rate",
 }
 
-CATEGORY_ALIASES = {
-    "洗发水": ["洗发水", "洗发露", "洗头膏", "洗发膏"],
-    "沐浴露": ["沐浴露", "沐浴乳"],
-    "护发素": ["护发素", "护发乳"],
-    "洗衣液": ["洗衣液", "洗衣凝珠"],
-    "鞋油": ["鞋油", "鞋蜡", "鞋膏"],
-}
-
-
 @dataclass
 class Candidate:
     num_iid: str
@@ -53,7 +49,7 @@ class Candidate:
     price: float | None = None
     moq: int = 0
     composite_score: float | None = None
-    shop_year: int = 0
+    shop_year: float | None = None
     sources: set[str] = field(default_factory=set)
     detail: dict[str, Any] = field(default_factory=dict)
     seller_info: dict[str, Any] = field(default_factory=dict)
@@ -108,7 +104,16 @@ def run_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
 
     score_candidates(candidates, weights)
     eligible = [c for c in candidates if not c.rejection]
-    final = sorted(eligible, key=lambda c: c.score, reverse=True)[:target_count]
+    final = []
+    shops: set[str] = set()
+    for candidate in sorted(eligible, key=lambda c: ((c.raw.get("purchase") or {}).get("status") == "confirmed", c.score), reverse=True):
+        shop = supplier_key(candidate.raw)
+        if shop in shops:
+            continue
+        shops.add(shop)
+        final.append(candidate)
+        if len(final) >= target_count:
+            break
     final_ids = {id(c) for c in final}
     rest = [c for c in candidates if id(c) not in final_ids]
 
@@ -164,31 +169,57 @@ def candidate_from_dict(item: dict[str, Any], target: dict[str, Any]) -> Candida
             or _nested(detail, "tradeService", "compositeNewScore")
             or seller.get("star")
         ),
-        shop_year=_to_int(item.get("shopYear") or item.get("shop_year") or seller.get("tpyear") or seller.get("shopYear")),
+        shop_year=_to_float(item.get("shopYear") if item.get("shopYear") is not None else item.get("shop_year") if item.get("shop_year") is not None else seller.get("tpyear") if seller.get("tpyear") is not None else seller.get("shopYear")),
         sources=sources,
         detail=detail,
         seller_info=seller,
         raw=item,
     )
-    if not c.sku_match_level:
-        c.sku_match_level = infer_sku_match_level(c, target)
+    selected = select_sku(item, target)
+    purchase = selected["purchase"]
+    c.raw = {**item, "selected_sku": selected, "match_evidence": selected["match"], "purchase": purchase, "purchaseStatus": purchase["status"], "landedCost": purchase["landed_unit"]}
+    c.sku_name = selected["sku_name"]
+    c.sku_match_level = {"matched": "完全一致", "unknown": "待确认", "mismatch": "SKU不一致"}[selected["match"]["status"]]
+    c.unit_price = selected["unit_price"]
+    c.price = selected["sku_price"]
+    c.moq = int(selected["moq"] or 0)
+    c.warnings.extend(purchase["missing"])
+    if purchase["status"] == "unavailable":
+        c.warnings.extend(purchase["reasons"])
+        if "当前地区不配送" in purchase["reasons"]:
+            _set_rejection(c, "当前地区不配送")
+    if item.get("detail_error"):
+        _set_rejection(c, "详情刷新失败待确认")
+    if target_attributes(target):
+        if selected["match"]["status"] == "unknown":
+            _set_rejection(c, "规格信息待确认")
+        elif selected["match"]["status"] == "mismatch":
+            _set_rejection(c, "SKU不一致")
+    if selected["stock"] is not None and selected["stock"] < selected["order_quantity"]:
+        _set_rejection(c, "目标SKU无库存" if selected["stock"] == 0 else "目标SKU库存不足")
+    if c.moq > selected["order_quantity"]:
+        _set_rejection(c, "采购数量低于起批数")
+    if target.get("allow_pack_substitution") and selected["attributes"].get("pack_count") != target_attributes(target).get("pack_count"):
+        c.sku_match_level = "规格同数量不同"
+        c.warnings.append("包装替代，已按实际采购数量折算")
     apply_relevance_hard_filters(c, target)
     apply_original_hard_downgrades(c, target)
     return c
 
 
 def score_candidates(candidates: list[Candidate], weights: dict[str, float]) -> None:
-    prices = [
-        c.unit_price
-        for c in candidates
-        if not c.rejection and c.unit_price and c.unit_price > 0
-    ]
-    p_min = min(prices) if prices else 0.0
-    p_max = max(prices) if prices else 0.0
-    p_range = p_max - p_min if p_max > p_min else 0.0
-
+    def comparable_price(candidate: Candidate) -> float | None:
+        return (candidate.raw.get("purchase") or {}).get("landed_unit") or candidate.unit_price
+    minimums: dict[bool, float] = {}
+    for candidate in candidates:
+        price = comparable_price(candidate)
+        known_cost = (candidate.raw.get("purchase") or {}).get("cost_status") == "confirmed"
+        if not candidate.rejection and price and price > 0:
+            minimums[known_cost] = min(minimums.get(known_cost, price), price)
     for c in candidates:
-        price_score = _price_score(c.unit_price, p_max, p_range)
+        reference = minimums.get((c.raw.get("purchase") or {}).get("cost_status") == "confirmed", 0)
+        price = comparable_price(c)
+        price_score = min(100.0, reference / price * 100.0) if reference and price and price > 0 else 0.0
         service_score = _service_score(c.composite_score)
         c.score_breakdown = {
             "price": round(price_score, 2),
@@ -204,19 +235,24 @@ def score_candidates(candidates: list[Candidate], weights: dict[str, float]) -> 
         else:
             c.recommendation_level = recommendation_level(c.score)
             apply_price_hard_filters(c)
+            if not c.rejection and (c.raw.get("purchase") or {}).get("status") != "confirmed":
+                c.recommendation_level = STATUS_LABELS["pending"]
 
 
 def apply_relevance_hard_filters(c: Candidate, target: dict[str, Any]) -> None:
     if not _target_has_relevance_signal(target):
         return
-    text = _normalize_match_text(" ".join([c.title, c.sku_name, _flatten_text(c.detail)]))
+    text = _normalize_match_text(" ".join([c.title, c.sku_name]))
+    attributes = (c.raw.get("selected_sku") or {}).get("attributes") or {}
     brand_aliases = _target_brand_aliases(target)
-    if brand_aliases and not any(_normalize_match_text(alias) in text for alias in brand_aliases):
+    brand_confirmed = bool(attributes.get("brand") and target.get("brand") and compare_attributes({"brand": target["brand"]}, attributes, brand_aliases)["status"] == "matched")
+    if brand_aliases and not brand_confirmed and not any(_normalize_match_text(alias) in text for alias in brand_aliases):
         _set_rejection(c, "品牌不匹配")
         return
 
     category = str(target.get("category") or "").strip()
-    if category and not any(_normalize_match_text(alias) in text for alias in _category_aliases(category)):
+    category_confirmed = bool(attributes.get("category") and compare_attributes({"category": category}, attributes)["status"] == "matched")
+    if category and not category_confirmed and not any(_normalize_match_text(alias) in text for alias in _category_aliases(category)):
         _set_rejection(c, "品类不匹配")
         return
 
@@ -227,7 +263,7 @@ def apply_relevance_hard_filters(c: Candidate, target: dict[str, Any]) -> None:
 def apply_original_hard_downgrades(c: Candidate, target: dict[str, Any]) -> None:
     if c.composite_score is not None and c.composite_score < 3.0:
         _set_rejection(c, "综合服务分 < 3.0")
-    if c.shop_year and c.shop_year < 1:
+    if c.shop_year is not None and c.shop_year < 1:
         _set_rejection(c, "入驻年限 < 1 年")
     buy_multiple = _to_int(target.get("buy_multiple") or target.get("batchQuantity") or target.get("purchaseMultiple"))
     if buy_multiple > 0 and c.moq > buy_multiple * 10:
@@ -241,18 +277,20 @@ def apply_price_hard_filters(c: Candidate) -> None:
         c.score = 0.0
         c.recommendation_level = "不推荐"
         return
-    if c.jd_price and c.jd_price > 0 and c.unit_price >= c.jd_price:
+    comparable = (c.raw.get("purchase") or {}).get("landed_unit") or c.unit_price
+    if c.jd_price and c.jd_price > 0 and comparable >= c.jd_price:
         _set_rejection(c, "价格不低于京东")
         c.score = 0.0
         c.recommendation_level = "不推荐"
         return
-    if c.score < 60:
-        _set_rejection(c, "综合得分 < 60")
-        c.score = 0.0
-        c.recommendation_level = "不推荐"
 
 
 def apply_stock_hard_filters(c: Candidate) -> None:
+    selected = c.raw.get("selected_sku")
+    if isinstance(selected, dict):
+        if selected.get("stock") == 0:
+            _set_rejection(c, "目标SKU无库存")
+        return
     detail = c.detail if isinstance(c.detail, dict) else {}
     sku_rows = _detail_sku_rows(detail)
     if sku_rows:
@@ -278,19 +316,8 @@ def apply_stock_hard_filters(c: Candidate) -> None:
 
 
 def infer_sku_match_level(c: Candidate, target: dict[str, Any]) -> str:
-    target_text = " ".join(str(x) for x in [
-        target.get("selected_sku"),
-        target.get("skuName"),
-        target.get("spec"),
-        *(target.get("variant") or []),
-    ] if x)
-    candidate_text = " ".join([c.title, c.sku_name, _flatten_text(c.detail)])
-    if target_text and target_text in candidate_text:
-        return "完全一致"
-    spec = str(target.get("spec") or "")
-    if spec and spec_in_text(spec, candidate_text):
-        return "规格同数量不同"
-    return "SKU不一致"
+    selected = select_sku(c.raw or {"title": c.title, "detail": c.detail}, target)
+    return {"matched": "完全一致", "unknown": "待确认", "mismatch": "SKU不一致"}[selected["match"]["status"]]
 
 
 def recommendation_level(score: float) -> str:
@@ -300,10 +327,13 @@ def recommendation_level(score: float) -> str:
         return "次选"
     if score >= 60:
         return "备选"
-    return "不推荐"
+    return "低优先级"
 
 
 def spec_in_text(spec: str, text: str) -> bool:
+    expected = measure(spec)
+    if expected:
+        return any(measure(m.group(0)) == expected for m in re.finditer(r"(?<![\d.])\d+(?:\.\d+)?\s*(?:kg|公斤|千克|g|克|ml|毫升|l|升)(?![a-zA-Z])", text, re.I))
     if not spec or not text:
         return False
     match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([a-zA-Z\u4e00-\u9fff]+)\s*", spec)
@@ -325,12 +355,12 @@ def _price_score(unit_price: float | None, p_max: float, p_range: float) -> floa
 
 def _service_score(composite_score: float | None) -> float:
     if composite_score is None:
-        return 0.0
+        return 60.0
     return max(0.0, min(100.0, composite_score * 20.0))
 
 
 def _target_brand_aliases(target: dict[str, Any]) -> list[str]:
-    raw = [target.get("brand"), *(target.get("brand_aliases") or [])]
+    raw = [*known_brand_aliases(str(target.get("brand") or "")), *(target.get("brand_aliases") or [])]
     out = []
     seen = set()
     for value in raw:
@@ -357,7 +387,7 @@ def _target_has_sku_signal(target: dict[str, Any]) -> bool:
 
 
 def _category_aliases(category: str) -> list[str]:
-    return CATEGORY_ALIASES.get(category, [category])
+    return category_aliases(category)
 
 
 def _normalize_match_text(value: str) -> str:
@@ -371,8 +401,10 @@ def _set_rejection(c: Candidate, reason: str) -> None:
 
 def _unit_aliases(unit: str) -> list[str]:
     normalized = unit.lower()
-    if normalized in {"g", "克", "ml", "毫升"}:
-        return ["g", "克", "ml", "毫升"]
+    if normalized in {"g", "克"}:
+        return ["g", "克"]
+    if normalized in {"ml", "毫升"}:
+        return ["ml", "毫升"]
     if normalized in {"kg", "千克", "公斤"}:
         return ["kg", "千克", "公斤"]
     if normalized in {"l", "升"}:
@@ -393,11 +425,14 @@ def _result(
         "target": target,
         "final": [c.to_dict() for c in final],
         "rejected": [c.to_dict() for c in rejected],
+        "pending": [c.to_dict() for c in rejected if c.rejection and ("待确认" in c.rejection or c.rejection == "价格缺失")],
         "rejected_reasons": dict(Counter(c.rejection or "unknown" for c in rejected)),
         "stats": {
             "input": len(final) + len(rest),
             "final_count": len(final),
             "target_count": target_count,
+            "confirmed_purchase_count": sum((c.raw.get("purchase") or {}).get("status") == "confirmed" for c in final),
+            "pending_purchase_count": sum((c.raw.get("purchase") or {}).get("status") != "confirmed" for c in final),
         },
         "weights": DEFAULT_WEIGHTS,
     }

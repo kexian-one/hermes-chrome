@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,8 @@ class EcomConfig:
     data_source: str
     onebound: dict[str, Any]
     alphashop_mcp: dict[str, Any]
+    runtime: dict[str, Any] = field(default_factory=dict)
+    vision: dict[str, Any] = field(default_factory=dict)
 
     def apply_env(self) -> None:
         if self.onebound.get("key"):
@@ -49,7 +51,7 @@ class EcomConfig:
 
 def load_ecom_config(project_root: Path | None = None) -> EcomConfig:
     root = project_root or _find_project_root()
-    path = root / "config.yaml"
+    path = Path(os.environ["ALL_IN_AI_CONFIG"]) if os.environ.get("ALL_IN_AI_CONFIG") else root / "config.yaml"
     if not path.is_file():
         raise FileNotFoundError(f"config.yaml not found at {path}")
     cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -60,6 +62,8 @@ def load_ecom_config(project_root: Path | None = None) -> EcomConfig:
         data_source=str(section.get("data_source") or "hybrid"),
         onebound=dict(section.get("onebound") or {}),
         alphashop_mcp=dict(section.get("alphashop_mcp") or {}),
+        runtime=dict(section.get("runtime") or {}),
+        vision=dict(section.get("vision") or {}),
     )
 
 

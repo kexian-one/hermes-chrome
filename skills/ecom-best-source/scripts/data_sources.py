@@ -1,46 +1,103 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import contextvars
 import base64
 import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import threading
 import time
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from contextlib import AsyncExitStack
+from concurrent.futures import Future, wait
+from contextlib import AsyncExitStack, contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
+import httpx
 
 from ecom_config import EcomConfig, load_ecom_config
+from runtime_support import cache_key, read_cache, write_cache, remaining_timeout, cancellable_sleep, refresh_details, OperationCancelled
 
 
 log = logging.getLogger(__name__)
+_task_session = contextvars.ContextVar("ecom_provider_session", default=None)
+_http_session = contextvars.ContextVar("ecom_http_session", default=None)
+BUSINESS_FIELDS = {
+    "price_tiers", "priceRanges", "price_scope", "endQuantity", "maxQuantity", "unitPrice", "salePrice",
+    "sales_unit", "unit", "unitName", "priceUnit", "stock", "quantity", "MOQ", "moq", "min_num", "minOrderQuantity", "currency",
+    "stock_unit", "moq_unit", "min_order_unit", "price_tax_included", "tax_included", "tax_rate", "tax_amount", "tax_quote", "tax_basis", "tax_scope", "tax_quantity",
+    "shipping_quote", "freightInfo", "shipping_rules", "freeShipping", "freeDeliverFee", "post_fee", "shipping_weight_g", "deliverable",
+    "discount_quote", "discounts", "barcode", "gtin", "gtin8", "gtin12", "gtin13", "gtin14", "ean", "upc", "identifiers", "barcode_scope", "identifier_scope", "gtin_scope", "scope", "barcode_level", "gtin_level", "identifier_level", "level",
+}
+
+
+def _business_fields(source: dict[str, Any]) -> dict[str, Any]:
+    return {key: copy.deepcopy(source[key]) for key in BUSINESS_FIELDS if key in source}
 
 
 class DataSourceStats:
-    def __init__(self, cost_per_call_yuan: float = 0.0) -> None:
+    def __init__(self, cost_per_call_yuan: float | None = None) -> None:
         self.cost_per_call_yuan = cost_per_call_yuan
         self.cache_hits: int = 0
+        self.coalesced_hits: int = 0
         self.new_calls: dict[str, int] = defaultdict(int)
+        self._lock = threading.Lock()
+
+    def record(self, operation: str) -> None:
+        with self._lock:
+            self.new_calls[operation] += 1
+
+    def record_hit(self, *, coalesced: bool = False) -> None:
+        with self._lock:
+            if coalesced:
+                self.coalesced_hits += 1
+            else:
+                self.cache_hits += 1
 
     def total_new(self) -> int:
         return sum(self.new_calls.values())
 
-    def total_cost_yuan(self) -> float:
-        return self.total_new() * self.cost_per_call_yuan
+    def total_cost_yuan(self) -> float | None:
+        return self.total_new() * self.cost_per_call_yuan if self.cost_per_call_yuan is not None else None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "cache_hits": self.cache_hits,
-            "new_calls": dict(self.new_calls),
-            "cost_yuan": round(self.total_cost_yuan(), 4),
-        }
+        with self._lock:
+            estimate = self.total_cost_yuan()
+            return {"cache_hits": self.cache_hits, "coalesced_hits": self.coalesced_hits, "new_calls": dict(self.new_calls), "cost_yuan": round(estimate, 4) if estimate is not None else None, "estimated_cost_yuan": round(estimate, 4) if estimate is not None else None, "actual_cost_yuan": None, "billing_source": None}
+
+
+def _coalesced_request(lock: threading.Lock, pending: dict[str, Future], key: str, load: Callable[[], Any], timeout: float, stats: DataSourceStats) -> Any:
+    remaining_timeout(timeout)
+    with lock:
+        future = pending.get(key)
+        owner = future is None
+        if owner:
+            future = pending[key] = Future()
+    if not owner:
+        stats.record_hit(coalesced=True)
+        while not future.done():
+            wait([future], timeout=min(0.05, remaining_timeout(timeout)))
+        remaining_timeout(timeout)
+        return copy.deepcopy(future.result())
+    try:
+        result = load()
+        remaining_timeout(timeout)
+        future.set_result(result)
+        return copy.deepcopy(result)
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with lock:
+            if pending.get(key) is future:
+                pending.pop(key, None)
 
 
 class OneboundClient:
@@ -54,7 +111,11 @@ class OneboundClient:
         self.timeout = int(self.cfg.onebound.get("http_timeout") or 30)
         self.cache_dir = cache_dir or _cache_dir("onebound")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.stats = DataSourceStats(float(self.cfg.onebound.get("cost_per_call_yuan") or 0.022))
+        self._request_lock = threading.Lock()
+        self._pending_requests: dict[str, Future] = {}
+        self._http_client = httpx.Client(timeout=self.timeout, follow_redirects=False)
+        fee = self.cfg.onebound.get("cost_per_call_yuan")
+        self.stats = DataSourceStats(float(fee) if fee not in (None, "") else None)
 
     def search(self, q: str, page: int = 1, page_size: int = 100, lang: str = "zh-CN") -> list[dict[str, Any]]:
         data = self._request("item_search", {
@@ -65,7 +126,7 @@ class OneboundClient:
         })
         items = data.get("items") or {}
         arr = items.get("item") if isinstance(items, dict) else None
-        return [normalize_candidate(x, source="text") for x in arr or [] if isinstance(x, dict)]
+        return [normalize_candidate({**x, "provider": "onebound"}, source="text") for x in arr or [] if isinstance(x, dict)]
 
     def search_image(self, img_url: str, page: int = 1, page_size: int = 50, lang: str = "zh-CN") -> list[dict[str, Any]]:
         clean_url = re.sub(r"\.webp$", "", img_url)
@@ -77,7 +138,7 @@ class OneboundClient:
         })
         items = data.get("items") or {}
         arr = items.get("item") if isinstance(items, dict) else None
-        return [normalize_candidate(x, source="image") for x in arr or [] if isinstance(x, dict)]
+        return [normalize_candidate({**x, "provider": "onebound"}, source="image") for x in arr or [] if isinstance(x, dict)]
 
     def item_get(self, num_iid: str, lang: str = "zh-CN") -> dict[str, Any]:
         data = self._request("item_get", {
@@ -86,7 +147,7 @@ class OneboundClient:
             "lang": lang,
         })
         item = data.get("item")
-        return item if isinstance(item, dict) else {}
+        return _normalize_onebound_detail(item) if isinstance(item, dict) else {}
 
     def seller_info(self, sid: str, lang: str = "zh-CN") -> dict[str, Any]:
         data = self._request("seller_info", {"sid": str(sid), "lang": lang})
@@ -95,21 +156,39 @@ class OneboundClient:
         return data if isinstance(data, dict) else {}
 
     def _request(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        cache_file = self.cache_dir / f"{_cache_key(path, params)}.json"
-        if cache_file.is_file():
-            self.stats.cache_hits += 1
-            return json.loads(cache_file.read_text(encoding="utf-8"))
-        self.stats.new_calls[path] += 1
+        request_key = cache_key(path, [params, bool(refresh_details.get())])
+        return _coalesced_request(self._request_lock, self._pending_requests, request_key, lambda: self._request_locked(path, params), self.timeout, self.stats)
+
+    def close(self) -> None:
+        self._http_client.close()
+
+    def _request_locked(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        cache_file = self.cache_dir / f"{_cache_key(path, {**params, '_scope': hashlib.sha256((self.base + self.key).encode()).hexdigest()})}.json"
+        ttl = float(self.cfg.runtime.get("detail_cache_seconds", 60)) if path == "item_get" else 3600 if path == "seller_info" else 300
+        if path == "item_get" and refresh_details.get():
+            ttl = 0
+        cached = read_cache(cache_file, ttl)
+        if cached is not None:
+            self.stats.record_hit()
+            return cached
         full_params = {**params, "key": self.key, "secret": self.secret}
         url = f"{self.base}/{path}/?{urllib.parse.urlencode(full_params)}"
         data: dict[str, Any] = {}
         last_error = ""
         for attempt, delay in enumerate([0.0, 0.5, 1.5], start=1):
             if delay:
-                time.sleep(delay)
+                cancellable_sleep(delay)
             try:
-                data = _http_get_json(url, self.timeout)
+                timeout = remaining_timeout(self.timeout)
+                self.stats.record(path)
+                http_context = _http_session.set(self._http_client)
+                try:
+                    data = _http_get_json(url, timeout)
+                finally:
+                    _http_session.reset(http_context)
+                remaining_timeout(self.timeout)
             except Exception as exc:
+                remaining_timeout(self.timeout)
                 last_error = self._redact(str(exc))
                 if attempt == 3:
                     raise RuntimeError(f"onebound {path} request failed: {last_error}") from exc
@@ -123,11 +202,49 @@ class OneboundClient:
             last_error = f"error_code={err_code}: {msg[:120]}"
         else:
             raise RuntimeError(f"onebound {path} request failed: {last_error}")
-        cache_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        if isinstance(data.get("item"), dict):
+            data["item"]["fetched_at"] = time.time()
+            data["item"]["provider"] = "onebound"
+        remaining_timeout(self.timeout)
+        write_cache(cache_file, data)
         return data
 
     def _redact(self, text: str) -> str:
         return str(text).replace(self.key, "***OB_KEY***").replace(self.secret, "***OB_SECRET***")
+
+
+def _normalize_onebound_detail(item: dict[str, Any]) -> dict[str, Any]:
+    from product_match import sku_rows
+    detail = copy.deepcopy(item)
+    images = detail.get("prop_imgs") or []
+    if isinstance(images, dict):
+        images = images.get("prop_img") or []
+    images = images if isinstance(images, list) else []
+    for row in sku_rows(detail):
+        bound_urls = _sku_image_urls(row)
+        if bound_urls:
+            row["sku_image_url"] = bound_urls[0]
+            row["sku_image_urls"] = bound_urls
+            continue
+        properties = set(str(row.get("properties") or "").split(";")) - {""}
+        bound_images = {str(img.get("url") or img.get("image") or "") for img in images if isinstance(img, dict) and str(img.get("properties") or "") in properties}
+        bound_images.discard("")
+        if len(bound_images) == 1:
+            row["sku_image_url"] = bound_images.pop()
+            row["sku_image_urls"] = [row["sku_image_url"]]
+    return detail
+
+
+def _sku_image_urls(row: dict[str, Any]) -> list[str]:
+    values = []
+    for key in ("sku_image_url", "skuImageUrl", "image", "pic_url", "sku_image_urls", "skuImageUrls", "image_urls", "imageUrls"):
+        value = row.get(key)
+        for entry in value if isinstance(value, list) else [value]:
+            if isinstance(entry, dict):
+                entry = entry.get("url") or entry.get("imageUrl")
+            if isinstance(entry, str) and entry.strip():
+                values.append(entry.strip())
+    return list(dict.fromkeys(values))
 
 
 class AlphashopMCPClient:
@@ -147,7 +264,9 @@ class AlphashopMCPClient:
         self.timeout = int(mcp_cfg.get("http_timeout") or 60)
         self.cache_dir = cache_dir or _cache_dir("alphashop")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.stats = DataSourceStats(0.0)
+        self._request_lock = threading.Lock()
+        self._pending_requests: dict[str, Future] = {}
+        self.stats = DataSourceStats(mcp_cfg.get("cost_per_call_yuan"))
         self._jwt_cache: tuple[str, float] | None = None
         self._runner = _MCPSessionRunner(self._build_url, self.timeout)
 
@@ -157,7 +276,7 @@ class AlphashopMCPClient:
             "keyword": str(q),
             "beginPage": _clamp_page(page),
         })
-        return [normalize_candidate(x, source="text") for x in _normalize_mcp_search_response(payload)]
+        return [normalize_candidate({**x, "provider": "alphashop"}, source="text") for x in _normalize_mcp_search_response(payload)]
 
     def search_image(self, img_url: str, page: int = 1, page_size: int = 50, lang: str = "zh-CN") -> list[dict[str, Any]]:
         del page_size, lang
@@ -165,7 +284,7 @@ class AlphashopMCPClient:
             "imgUrl": str(img_url),
             "beginPage": _clamp_page(page),
         })
-        return [normalize_candidate(x, source="image") for x in _normalize_mcp_search_response(payload)]
+        return [normalize_candidate({**x, "provider": "alphashop"}, source="image") for x in _normalize_mcp_search_response(payload)]
 
     def item_get(self, num_iid: str, lang: str = "zh-CN") -> dict[str, Any]:
         del lang
@@ -180,14 +299,26 @@ class AlphashopMCPClient:
         self._runner.close()
 
     def _call(self, tool: str, params: dict[str, Any]) -> Any:
-        cache_file = self.cache_dir / f"{_cache_key(tool, params)}.json"
-        if cache_file.is_file():
-            self.stats.cache_hits += 1
-            return json.loads(cache_file.read_text(encoding="utf-8"))
-        self.stats.new_calls[tool] += 1
+        request_key = cache_key(tool, [params, bool(refresh_details.get())])
+        return _coalesced_request(self._request_lock, self._pending_requests, request_key, lambda: self._call_locked(tool, params), self.timeout, self.stats)
+
+    def _call_locked(self, tool: str, params: dict[str, Any]) -> Any:
+        cache_file = self.cache_dir / f"{_cache_key(tool, {**params, '_scope': hashlib.sha256((self.endpoint + self.ak).encode()).hexdigest()})}.json"
+        ttl = float(self.cfg.runtime.get("detail_cache_seconds", 60)) if tool == self.TOOL_DETAIL else 300
+        if tool == self.TOOL_DETAIL and refresh_details.get():
+            ttl = 0
+        cached = read_cache(cache_file, ttl)
+        if cached is not None:
+            self.stats.record_hit()
+            return cached
+        remaining_timeout(self.timeout)
+        self.stats.record(tool)
         payload = self._runner.call_tool(tool, params)
+        remaining_timeout(self.timeout)
+        if isinstance(payload, dict):
+            payload["_fetched_at"] = time.time()
         if _cacheable_payload(payload):
-            cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            write_cache(cache_file, payload)
         return payload
 
     def _jwt_token(self) -> str:
@@ -209,11 +340,12 @@ class AlphashopMCPClient:
 
 
 class HybridDataClient:
-    def __init__(self, cfg: EcomConfig | None = None) -> None:
+    def __init__(self, cfg: EcomConfig | None = None, *, provider_pool: dict[str, Any] | None = None) -> None:
         self.cfg = cfg or load_ecom_config()
         self.mode = self.cfg.data_source
         self._ob: OneboundClient | None = None
         self._mcp: AlphashopMCPClient | None = None
+        self._provider_pool = provider_pool
         self._init_clients()
 
     @property
@@ -236,13 +368,15 @@ class HybridDataClient:
             try:
                 detail = self._mcp.item_get(num_iid)
             except Exception as exc:
-                log.warning("MCP item_get failed; fallback to onebound: %s", exc)
+                remaining_timeout(1)
+                log.warning("MCP item_get failed; fallback to onebound: %s", type(exc).__name__)
                 return self._ob.item_get(num_iid)
             if _detail_needs_onebound_enrichment(detail):
                 try:
                     onebound_detail = self._ob.item_get(num_iid)
                 except Exception as exc:
-                    log.warning("onebound item_get enrichment failed: %s", exc)
+                    remaining_timeout(1)
+                    log.warning("onebound item_get enrichment failed: %s", type(exc).__name__)
                 else:
                     detail = _merge_detail_enrichment(detail, onebound_detail)
             return detail
@@ -254,21 +388,34 @@ class HybridDataClient:
         return self._ob.seller_info(sid)
 
     def close(self) -> None:
+        if self._provider_pool is not None:
+            return
         if self._mcp:
             self._mcp.close()
+        if self._ob:
+            self._ob.close()
 
     def _init_clients(self) -> None:
         if self.mode in ("onebound", "hybrid"):
             try:
-                self._ob = OneboundClient(self.cfg)
+                self._ob = self._provider_pool.get("onebound") if self._provider_pool is not None else None
+                if self._ob is None:
+                    self._ob = OneboundClient(self.cfg)
+                    if self._provider_pool is not None:
+                        self._provider_pool["onebound"] = self._ob
             except Exception as exc:
                 if self.mode == "onebound":
                     raise
                 log.warning("onebound unavailable in hybrid mode: %s", exc)
         if self.mode in ("mcp", "hybrid"):
             try:
-                self._mcp = AlphashopMCPClient(self.cfg)
+                self._mcp = self._provider_pool.get("alphashop_mcp") if self._provider_pool is not None else None
+                if self._mcp is None:
+                    self._mcp = AlphashopMCPClient(self.cfg)
+                    if self._provider_pool is not None:
+                        self._provider_pool["alphashop_mcp"] = self._mcp
             except Exception as exc:
+                remaining_timeout(1)
                 if self.mode == "mcp":
                     raise
                 log.warning("alphashop MCP unavailable in hybrid mode: %s", exc)
@@ -278,17 +425,76 @@ class HybridDataClient:
     def _call_with_fallback(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if self._mcp:
             try:
-                return getattr(self._mcp, method)(*args, **kwargs)
+                result = getattr(self._mcp, method)(*args, **kwargs)
+                if result or self.mode != "hybrid" or not self._ob:
+                    return result
             except Exception as exc:
+                remaining_timeout(1)
                 if self.mode != "hybrid" or not self._ob:
                     raise
-                log.warning("MCP %s failed; fallback to onebound: %s", method, exc)
+                log.warning("MCP %s failed; fallback to onebound: %s", method, type(exc).__name__)
         if not self._ob:
             return [] if method.startswith("search") else {}
         return getattr(self._ob, method)(*args, **kwargs)
 
 
+class TaskDataSession:
+    def __init__(self, cfg: EcomConfig) -> None:
+        self.cfg = cfg
+        self.providers: dict[str, Any] = {}
+        self.clients: dict[str, HybridDataClient] = {}
+        self._lock = threading.Lock()
+        self.closed = False
+
+    def client(self, mode: str | None) -> HybridDataClient:
+        mode = mode or self.cfg.data_source
+        if mode not in {"onebound", "mcp", "hybrid"}:
+            raise ValueError("data_source must be onebound, mcp, or hybrid")
+        remaining_timeout(1)
+        with self._lock:
+            if self.closed:
+                raise OperationCancelled("任务数据源会话已关闭")
+            if mode not in self.clients:
+                self.clients[mode] = HybridDataClient(replace(self.cfg, data_source=mode), provider_pool=self.providers)
+            return self.clients[mode]
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {name: self.providers[name].stats.to_dict() if name in self.providers else None for name in ("onebound", "alphashop_mcp")}
+
+    def close(self) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            self.closed = True
+            providers = list(self.providers.values())
+        for provider in providers:
+            provider.close()
+
+
+@contextmanager
+def task_data_session(cfg: EcomConfig):
+    session = TaskDataSession(cfg)
+    token = _task_session.set(session)
+    try:
+        yield session
+    finally:
+        _task_session.reset(token)
+        session.close()
+
+
+def release_data_client(client: Any) -> None:
+    session = _task_session.get()
+    if session is None or not any(value is client for value in session.clients.values()):
+        client.close()
+
+
 def make_data_client(data_source: str | None = None) -> HybridDataClient:
+    if os.environ.get("ALL_IN_AI_OFFLINE") == "1":
+        raise RuntimeError("offline mode: external sourcing calls disabled")
+    session = _task_session.get()
+    if session is not None:
+        return session.client(data_source)
     cfg = load_ecom_config()
     if data_source:
         if data_source not in {"onebound", "mcp", "hybrid"}:
@@ -323,6 +529,12 @@ def normalize_candidate(item: dict[str, Any], source: str) -> dict[str, Any]:
         "shopName": _shop_name_from(item),
         "sources": sorted(set([source, *[str(s) for s in item.get("sources", []) if s]])),
     })
+    seller = dict(item.get("seller_info") or {})
+    seller_id = item.get("sellerId") or item.get("supplierId") or item.get("memberId")
+    if seller_id and not seller.get("sid"):
+        seller["sid"] = str(seller_id)
+    if seller:
+        out["seller_info"] = seller
     return out
 
 
@@ -338,6 +550,8 @@ def merge_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         existing = merged[key]
         existing["sources"].update(item.get("sources") or [])
+        hits = [*existing.get("retrieval_hits", []), *item.get("retrieval_hits", [])]
+        existing["retrieval_hits"] = list({json.dumps(hit, ensure_ascii=False, sort_keys=True): hit for hit in hits}.values())
         for field in ("price", "sales", "pic_url", "detail_url", "shopName"):
             if not existing.get(field) and item.get(field):
                 existing[field] = item[field]
@@ -369,6 +583,7 @@ def _normalize_mcp_search_response(payload: Any) -> list[dict[str, Any]]:
 
 def _normalize_mcp_search_item(raw: dict[str, Any]) -> dict[str, Any]:
     return {
+        **_business_fields(raw),
         "num_iid": str(raw.get("offerId") or "").strip(),
         "title": str(raw.get("originTitle") or raw.get("aiTitle") or "").strip(),
         "pic_url": str(raw.get("originImageUrl") or raw.get("aiImageUrl") or "").strip(),
@@ -376,6 +591,7 @@ def _normalize_mcp_search_item(raw: dict[str, Any]) -> dict[str, Any]:
         "price": raw.get("price"),
         "sales": _to_int(raw.get("soldOut")),
         "shopName": _shop_name_from(raw),
+        "sellerId": str(raw.get("sellerId") or raw.get("supplierId") or raw.get("memberId") or ""),
     }
 
 
@@ -398,7 +614,7 @@ def _normalize_mcp_detail_response(payload: Any) -> dict[str, Any]:
             continue
         attrs = sku.get("productSkuAttributeInfos") or []
         pairs = []
-        sku_img = ""
+        sku_images = _sku_image_urls(sku)
         for attr in attrs:
             if not isinstance(attr, dict):
                 continue
@@ -406,14 +622,19 @@ def _normalize_mcp_detail_response(payload: Any) -> dict[str, Any]:
             value = str(attr.get("value") or "").strip()
             if name and value:
                 pairs.append(f"{name}:{value}")
-            if not sku_img:
-                sku_img = str(attr.get("skuImageUrl") or "").strip()
+            sku_images.extend(_sku_image_urls(attr))
+        sku_images = list(dict.fromkeys(sku_images))
         sku_rows.append({
+            **_business_fields(sku),
             "sku_id": str(sku.get("skuId") or ""),
             "properties_name": ";".join(pairs),
-            "quantity": _to_int(sku.get("amountOnSale")),
+            "quantity": _to_int(sku.get("amountOnSale", sku.get("quantity", sku.get("stock")))) if sku.get("amountOnSale", sku.get("quantity", sku.get("stock"))) not in (None, "") else None,
             "price": _to_float(sku.get("price")),
-            "sku_image_url": sku_img,
+            "sku_image_url": sku_images[0] if sku_images else "",
+            "sku_image_urls": sku_images,
+            "minOrderQuantity": sku.get("minOrderQuantity"),
+            "price_tiers": sku.get("priceRanges") or [],
+            "raw": sku,
         })
     props = []
     for prop in raw.get("productAttributeInfos") or []:
@@ -425,20 +646,27 @@ def _normalize_mcp_detail_response(payload: Any) -> dict[str, Any]:
             props.append({"name": name, "value": value})
     imgs = raw.get("originImageUrls") or raw.get("aiImageUrls") or []
     return {
+        **_business_fields(raw),
         "num_iid": str(raw.get("offerId") or "").strip(),
         "title": str(raw.get("originTitle") or raw.get("aiTitle") or "").strip(),
         "pic_url": str(imgs[0]).strip() if isinstance(imgs, list) and imgs else "",
         "item_imgs": [{"url": str(u)} for u in imgs if u] if isinstance(imgs, list) else [],
         "sales": _to_int(raw.get("soldOut")),
         "min_num": _to_int(raw.get("minOrderQuantity")) or 1,
-        "unit": "",
-        "num": sum(_to_int(s.get("quantity")) for s in sku_rows),
-        "price": sku_rows[0].get("price") if sku_rows else None,
+        "unit": str(raw.get("unit") or raw.get("saleUnit") or ""),
+        "num": sum(s["quantity"] for s in sku_rows) if sku_rows and all(s["quantity"] is not None for s in sku_rows) else None,
+        "price": sku_rows[0].get("price") if len(sku_rows) == 1 else None,
+        "price_tiers": raw.get("priceRanges") or [],
+        "fetched_at": payload.get("_fetched_at"),
+        "provider": "alphashop",
+        "raw": raw,
         "skus": {"sku": sku_rows},
         "props": props,
         "seller_info": {
             "sid": str(raw.get("sellerId") or raw.get("supplierId") or raw.get("memberId") or ""),
             "nick": _shop_name_from(raw),
+            "star": raw.get("compositeScore") or raw.get("serviceScore"),
+            "tpyear": raw.get("shopYear"),
         },
     }
 
@@ -456,7 +684,10 @@ def _detail_needs_onebound_enrichment(detail: dict[str, Any]) -> bool:
         or _nested(detail, "tradeService", "compositeNewScore")
     )
     has_year = bool(seller.get("tpyear") or seller.get("shopYear") or detail.get("shopYear"))
-    return not (has_sid and has_shop and has_score and has_year)
+    from product_match import sku_rows
+    rows = sku_rows(detail)
+    incomplete_skus = not rows or any(row.get("price") in (None, "") or row.get("quantity") in (None, "") or not row.get("sku_image_url") for row in rows)
+    return incomplete_skus or not (has_sid and has_shop and has_score and has_year)
 
 
 def _merge_detail_enrichment(base: dict[str, Any], enrichment: dict[str, Any]) -> dict[str, Any]:
@@ -480,6 +711,23 @@ def _merge_detail_enrichment(base: dict[str, Any], enrichment: dict[str, Any]) -
             seller[key] = value
     if seller:
         merged["seller_info"] = seller
+    from product_match import sku_rows
+    rows, extra_rows = sku_rows(base), sku_rows(enrichment)
+    if rows and extra_rows:
+        indexed = {str(row.get("sku_id") or row.get("skuId") or ""): row for row in extra_rows}
+        enriched_rows = []
+        for row in rows:
+            result = dict(row)
+            row_id = str(row.get("sku_id") or row.get("skuId") or "")
+            if row_id and row_id in indexed:
+                for key, value in indexed[row_id].items():
+                    if result.get(key) in (None, "", [], {}) and value not in (None, "", [], {}):
+                        result[key] = value
+            enriched_rows.append(result)
+        merged["skus"] = {"sku": enriched_rows}
+        timestamps = [float(d["fetched_at"]) for d in (base, enrichment) if d.get("fetched_at")]
+        if timestamps:
+            merged["fetched_at"] = min(timestamps)
     return merged
 
 
@@ -494,6 +742,9 @@ class _MCPSessionRunner:
         self._ready = threading.Event()
         self._start_err: Exception | None = None
         self._lock = threading.Lock()
+        self._stop_event: asyncio.Event | None = None
+        self._lifecycle: asyncio.Task | None = None
+        self._connect_timeout = timeout
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         self._ensure_started()
@@ -503,63 +754,77 @@ class _MCPSessionRunner:
             return await self._session.call_tool(name, arguments)
 
         future = asyncio.run_coroutine_threadsafe(_do(), self._loop)
-        return _extract_tool_payload(future.result(timeout=self._timeout + 10))
+        try:
+            while not future.done():
+                wait([future], timeout=min(0.05, remaining_timeout(self._timeout + 10)))
+            remaining_timeout(self._timeout + 10)
+            return _extract_tool_payload(future.result())
+        except (TimeoutError, OperationCancelled):
+            future.cancel()
+            raise
 
     def close(self) -> None:
-        if not self._loop or not self._loop.is_running():
-            return
-
-        async def _shutdown() -> None:
-            if self._stack:
-                await self._stack.aclose()
-
-        try:
-            future = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
-            future.result(timeout=5)
-        except Exception:
-            pass
-        self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._loop and self._loop.is_running() and self._stop_event:
+            self._loop.call_soon_threadsafe(self._stop_event.set)
+            if self._thread:
+                self._thread.join(timeout=5)
+                if self._thread.is_alive() and self._lifecycle:
+                    self._loop.call_soon_threadsafe(self._lifecycle.cancel)
+                    self._thread.join(timeout=2)
 
     def _ensure_started(self) -> None:
         if self._thread and self._thread.is_alive() and self._ready.is_set():
             if self._start_err:
-                raise RuntimeError(f"MCP session failed to start: {self._start_err}")
+                raise RuntimeError(f"MCP session failed to start: {type(self._start_err).__name__}")
             return
-        with self._lock:
+        while not self._lock.acquire(timeout=min(0.05, remaining_timeout(self._timeout + 10))):
+            pass
+        try:
             if self._thread and self._thread.is_alive() and self._ready.is_set():
                 if self._start_err:
-                    raise RuntimeError(f"MCP session failed to start: {self._start_err}")
+                    raise RuntimeError(f"MCP session failed to start: {type(self._start_err).__name__}")
                 return
             self._ready.clear()
             self._start_err = None
+            self._connect_timeout = remaining_timeout(self._timeout)
             self._thread = threading.Thread(target=self._thread_main, name="ecom-alphashop-mcp", daemon=True)
             self._thread.start()
-            if not self._ready.wait(timeout=self._timeout + 10):
-                raise RuntimeError("MCP session start timeout")
+            while not self._ready.wait(timeout=min(0.05, remaining_timeout(self._timeout + 10))):
+                pass
+            remaining_timeout(self._timeout + 10)
             if self._start_err:
-                raise RuntimeError(f"MCP session failed to start: {self._start_err}")
+                raise RuntimeError(f"MCP session failed to start: {type(self._start_err).__name__}")
+        finally:
+            self._lock.release()
 
     def _thread_main(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        self._lifecycle = self._loop.create_task(self._async_lifecycle())
         try:
-            self._loop.run_until_complete(self._async_setup())
-            self._ready.set()
-            self._loop.run_forever()
+            self._loop.run_until_complete(self._lifecycle)
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
             self._start_err = exc
+        finally:
             self._ready.set()
+            self._session = None
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            self._loop.close()
 
-    async def _async_setup(self) -> None:
+    async def _async_lifecycle(self) -> None:
         from mcp.client.session import ClientSession
         from mcp.client.sse import sse_client
 
-        self._stack = AsyncExitStack()
-        read, write = await self._stack.enter_async_context(
-            sse_client(self._url_builder(), timeout=self._timeout)
-        )
-        self._session = await self._stack.enter_async_context(ClientSession(read, write))
-        await self._session.initialize()
+        self._stop_event = asyncio.Event()
+        async with AsyncExitStack() as stack:
+            self._stack = stack
+            read, write = await stack.enter_async_context(sse_client(self._url_builder(), timeout=self._connect_timeout))
+            self._session = await stack.enter_async_context(ClientSession(read, write))
+            await self._session.initialize()
+            self._ready.set()
+            await self._stop_event.wait()
 
 
 def _extract_tool_payload(result: Any) -> Any:
@@ -618,8 +883,7 @@ def _project_root() -> Path:
 
 
 def _cache_key(path: str, params: dict[str, Any]) -> str:
-    encoded = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params.items()))
-    return re.sub(r"[^A-Za-z0-9._-]", "_", f"{path}_{encoded}")[:200]
+    return cache_key(path, params)
 
 
 def _cacheable_payload(payload: Any) -> bool:
@@ -628,7 +892,12 @@ def _cacheable_payload(payload: Any) -> bool:
     return True
 
 
-def _http_get_json(url: str, timeout: int) -> dict[str, Any]:
+def _http_get_json(url: str, timeout: float) -> dict[str, Any]:
+    session = _http_session.get()
+    if session is not None:
+        response = session.get(url, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
     try:
         from curl_cffi import requests as crequests
     except Exception:

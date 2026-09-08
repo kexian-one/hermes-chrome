@@ -1,6 +1,8 @@
 config.yaml
 all-keys.env
 state/schedule.yaml
+state/workers.json
+state/dispatch.json
 state/oicc-bridge/
 logs/
 __pycache__/

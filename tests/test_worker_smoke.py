@@ -204,7 +204,7 @@ async def test_run_without_browser_mcp_does_not_connect(skills_dir: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_ecom_requires_csv_before_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_ecom_requires_csv_before_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, valid_sourcing_writer) -> None:
     output_dir = tmp_path / "outputs" / "b1-test"
     output_dir.mkdir(parents=True)
     monkeypatch.setenv("WORKER_PROJECT_ROOT", str(tmp_path))
@@ -253,7 +253,7 @@ async def test_ecom_requires_csv_before_success(tmp_path: Path, monkeypatch: pyt
 
 @pytest.mark.asyncio
 async def test_ecom_stops_before_post_csv_verification_tools(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, valid_sourcing_writer,
 ) -> None:
     output_dir = tmp_path / "outputs" / "b1-test"
     output_dir.mkdir(parents=True)
@@ -551,7 +551,7 @@ async def test_browser_builtin_tool_uses_current_mcp_and_writes_scratch(
 
 @pytest.mark.asyncio
 async def test_ecom_browser_extract_failure_can_fallback_to_csv(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, valid_sourcing_writer,
 ) -> None:
     output_dir = tmp_path / "outputs" / "b1-test"
     output_dir.mkdir(parents=True)
